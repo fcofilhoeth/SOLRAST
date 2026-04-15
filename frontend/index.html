@@ -1,0 +1,908 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SolTrace — Investigador On-Chain Solana</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Sora:wght@300;400;600;700&display=swap" rel="stylesheet" />
+  <!-- Markdown renderer -->
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --sol-green:   #14F195;
+      --sol-purple:  #9945FF;
+      --sol-bg:      #07070f;
+      --sol-surface: #0f0f1a;
+      --sol-card:    #111120;
+      --sol-border:  rgba(153, 69, 255, 0.2);
+      --sol-border2: rgba(20, 241, 149, 0.2);
+      --sol-text:    #e2e2f0;
+      --sol-muted:   #7a7a99;
+      --sol-red:     #FF6B6B;
+      --sol-orange:  #FFB347;
+    }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      background: var(--sol-bg);
+      font-family: 'Sora', sans-serif;
+      color: var(--sol-text);
+      min-height: 100vh;
+      overflow-x: hidden;
+    }
+
+    /* ── Background grid ── */
+    body::before {
+      content: '';
+      position: fixed;
+      inset: 0;
+      background-image:
+        linear-gradient(rgba(153,69,255,0.04) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(153,69,255,0.04) 1px, transparent 1px);
+      background-size: 40px 40px;
+      pointer-events: none;
+      z-index: 0;
+    }
+
+    /* ── Glow orbs ── */
+    .orb {
+      position: fixed;
+      border-radius: 50%;
+      filter: blur(120px);
+      pointer-events: none;
+      z-index: 0;
+    }
+    .orb-1 { width: 500px; height: 500px; background: rgba(153,69,255,0.12); top: -150px; right: -100px; }
+    .orb-2 { width: 400px; height: 400px; background: rgba(20,241,149,0.08); bottom: -100px; left: -100px; }
+
+    /* ── Layout ── */
+    .container {
+      position: relative;
+      z-index: 1;
+      max-width: 900px;
+      margin: 0 auto;
+      padding: 40px 24px 80px;
+    }
+
+    /* ── Header ── */
+    .header {
+      text-align: center;
+      margin-bottom: 48px;
+    }
+
+    .logo {
+      display: inline-flex;
+      align-items: center;
+      gap: 14px;
+      margin-bottom: 16px;
+    }
+
+    .logo-icon {
+      width: 56px; height: 56px;
+      border-radius: 16px;
+      background: linear-gradient(135deg, #9945FF, #14F195);
+      display: flex; align-items: center; justify-content: center;
+      font-size: 26px;
+      box-shadow: 0 0 30px rgba(153,69,255,0.4);
+    }
+
+    .logo-text { text-align: left; }
+
+    .logo-tag {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 10px;
+      letter-spacing: 4px;
+      text-transform: uppercase;
+      color: var(--sol-green);
+      margin-bottom: 2px;
+    }
+
+    .logo-name {
+      font-size: 28px;
+      font-weight: 700;
+      color: #fff;
+      letter-spacing: -0.5px;
+    }
+
+    .header-desc {
+      font-size: 15px;
+      color: var(--sol-muted);
+      line-height: 1.6;
+      max-width: 520px;
+      margin: 0 auto;
+    }
+
+    /* ── Card ── */
+    .card {
+      background: var(--sol-card);
+      border: 1px solid var(--sol-border);
+      border-radius: 20px;
+      padding: 32px;
+      margin-bottom: 24px;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .card::before {
+      content: '';
+      position: absolute;
+      top: 0; left: 0; right: 0;
+      height: 1px;
+      background: linear-gradient(90deg, transparent, rgba(153,69,255,0.5), transparent);
+    }
+
+    .card-title {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 10px;
+      letter-spacing: 3px;
+      text-transform: uppercase;
+      color: var(--sol-green);
+      margin-bottom: 24px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .card-title::after {
+      content: '';
+      flex: 1;
+      height: 1px;
+      background: linear-gradient(90deg, rgba(20,241,149,0.3), transparent);
+    }
+
+    /* ── Form ── */
+    .form-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+    }
+
+    .form-group { display: flex; flex-direction: column; gap: 8px; }
+    .form-group.full { grid-column: 1 / -1; }
+
+    label {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11px;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      color: var(--sol-muted);
+    }
+
+    label span.required { color: var(--sol-red); margin-left: 2px; }
+
+    input {
+      background: rgba(0,0,0,0.4);
+      border: 1px solid var(--sol-border);
+      border-radius: 10px;
+      padding: 12px 16px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 13px;
+      color: var(--sol-text);
+      outline: none;
+      transition: border-color 0.2s, box-shadow 0.2s;
+      width: 100%;
+    }
+
+    input::placeholder { color: rgba(122,122,153,0.5); }
+    input:focus {
+      border-color: var(--sol-purple);
+      box-shadow: 0 0 0 3px rgba(153,69,255,0.12);
+    }
+
+    .input-hint {
+      font-size: 11px;
+      color: rgba(122,122,153,0.7);
+      margin-top: 2px;
+    }
+
+    /* ── Button ── */
+    .btn-investigate {
+      width: 100%;
+      margin-top: 24px;
+      padding: 16px 24px;
+      border-radius: 12px;
+      border: none;
+      background: linear-gradient(135deg, #9945FF, #7b2fd4);
+      color: #fff;
+      font-family: 'Sora', sans-serif;
+      font-size: 15px;
+      font-weight: 600;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      transition: all 0.2s;
+      box-shadow: 0 4px 20px rgba(153,69,255,0.3);
+      position: relative;
+      overflow: hidden;
+    }
+
+    .btn-investigate::after {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(135deg, rgba(255,255,255,0.1), transparent);
+      opacity: 0;
+      transition: opacity 0.2s;
+    }
+
+    .btn-investigate:hover { transform: translateY(-1px); box-shadow: 0 6px 25px rgba(153,69,255,0.45); }
+    .btn-investigate:hover::after { opacity: 1; }
+    .btn-investigate:active { transform: translateY(0); }
+    .btn-investigate:disabled { opacity: 0.6; cursor: not-allowed; transform: none; }
+
+    /* ── Loading ── */
+    #loading { display: none; }
+
+    .loading-steps {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .step {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      opacity: 0.3;
+      transition: opacity 0.4s;
+    }
+
+    .step.active { opacity: 1; }
+    .step.done { opacity: 0.6; }
+
+    .step-icon {
+      width: 32px; height: 32px;
+      border-radius: 8px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 14px;
+      background: rgba(153,69,255,0.1);
+      border: 1px solid rgba(153,69,255,0.2);
+      flex-shrink: 0;
+    }
+
+    .step.active .step-icon {
+      background: rgba(153,69,255,0.2);
+      border-color: var(--sol-purple);
+      animation: pulse-icon 1s infinite;
+    }
+
+    .step.done .step-icon {
+      background: rgba(20,241,149,0.1);
+      border-color: var(--sol-green);
+    }
+
+    @keyframes pulse-icon {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(153,69,255,0.4); }
+      50% { box-shadow: 0 0 0 6px rgba(153,69,255,0); }
+    }
+
+    .step-label {
+      font-size: 13px;
+      color: var(--sol-text);
+    }
+
+    .step.active .step-label { color: #fff; font-weight: 600; }
+
+    .step-sub {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11px;
+      color: var(--sol-muted);
+      margin-top: 2px;
+    }
+
+    /* ── Progress bar ── */
+    .progress-bar {
+      height: 3px;
+      background: rgba(153,69,255,0.15);
+      border-radius: 2px;
+      margin-bottom: 24px;
+      overflow: hidden;
+    }
+
+    .progress-fill {
+      height: 100%;
+      background: linear-gradient(90deg, var(--sol-purple), var(--sol-green));
+      border-radius: 2px;
+      width: 0%;
+      transition: width 0.5s ease;
+    }
+
+    /* ── Alert CEX ── */
+    .alert-cex {
+      background: rgba(255,107,107,0.08);
+      border: 1px solid rgba(255,107,107,0.3);
+      border-radius: 12px;
+      padding: 20px;
+      margin-bottom: 20px;
+      display: flex;
+      gap: 14px;
+      align-items: flex-start;
+    }
+
+    .alert-icon { font-size: 24px; flex-shrink: 0; }
+
+    .alert-title {
+      font-weight: 700;
+      color: var(--sol-red);
+      font-size: 14px;
+      margin-bottom: 4px;
+    }
+
+    .alert-body { font-size: 13px; color: var(--sol-text); line-height: 1.5; }
+
+    /* ── Result (markdown render) ── */
+    #result { display: none; }
+
+    .report-content {
+      font-size: 14px;
+      line-height: 1.7;
+      color: var(--sol-text);
+    }
+
+    .report-content h1,
+    .report-content h2,
+    .report-content h3 {
+      color: #fff;
+      margin: 24px 0 12px;
+      font-family: 'Sora', sans-serif;
+    }
+
+    .report-content h3 {
+      font-size: 15px;
+      color: var(--sol-green);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .report-content p { margin-bottom: 12px; }
+
+    .report-content code {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 12px;
+      background: rgba(153,69,255,0.12);
+      border: 1px solid rgba(153,69,255,0.2);
+      border-radius: 4px;
+      padding: 2px 6px;
+      color: #c8b4ff;
+      word-break: break-all;
+    }
+
+    .report-content pre {
+      background: rgba(0,0,0,0.5);
+      border: 1px solid var(--sol-border);
+      border-radius: 12px;
+      padding: 16px;
+      overflow-x: auto;
+      margin: 12px 0;
+    }
+
+    .report-content pre code {
+      background: none;
+      border: none;
+      padding: 0;
+      color: var(--sol-green);
+      font-size: 12px;
+    }
+
+    .report-content table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 16px 0;
+      font-size: 13px;
+    }
+
+    .report-content th {
+      background: rgba(153,69,255,0.15);
+      border: 1px solid var(--sol-border);
+      padding: 10px 14px;
+      text-align: left;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11px;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      color: var(--sol-green);
+    }
+
+    .report-content td {
+      border: 1px solid var(--sol-border);
+      padding: 10px 14px;
+      color: var(--sol-text);
+    }
+
+    .report-content tr:nth-child(even) td { background: rgba(255,255,255,0.02); }
+
+    .report-content ul, .report-content ol {
+      padding-left: 20px;
+      margin-bottom: 12px;
+    }
+
+    .report-content li { margin-bottom: 6px; }
+
+    .report-content strong { color: #fff; }
+
+    .report-content blockquote {
+      border-left: 3px solid var(--sol-purple);
+      padding-left: 16px;
+      color: var(--sol-muted);
+      margin: 12px 0;
+    }
+
+    /* ── Meta chips ── */
+    .meta-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 20px;
+    }
+
+    .chip {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11px;
+      padding: 5px 12px;
+      border-radius: 20px;
+      border: 1px solid;
+    }
+
+    .chip-green { color: var(--sol-green); border-color: rgba(20,241,149,0.3); background: rgba(20,241,149,0.06); }
+    .chip-purple { color: #BB86FC; border-color: rgba(187,134,252,0.3); background: rgba(187,134,252,0.06); }
+    .chip-orange { color: var(--sol-orange); border-color: rgba(255,179,71,0.3); background: rgba(255,179,71,0.06); }
+    .chip-red { color: var(--sol-red); border-color: rgba(255,107,107,0.3); background: rgba(255,107,107,0.06); }
+
+    /* ── Error ── */
+    #error-box {
+      display: none;
+      background: rgba(255,107,107,0.08);
+      border: 1px solid rgba(255,107,107,0.3);
+      border-radius: 12px;
+      padding: 20px;
+      margin-top: 16px;
+    }
+
+    .error-title {
+      color: var(--sol-red);
+      font-weight: 700;
+      margin-bottom: 8px;
+    }
+
+    .error-msg {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 12px;
+      color: var(--sol-muted);
+    }
+
+    /* ── Footer ── */
+    .footer {
+      text-align: center;
+      margin-top: 48px;
+      padding-top: 24px;
+      border-top: 1px solid var(--sol-border);
+    }
+
+    .footer-text {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11px;
+      color: var(--sol-muted);
+      letter-spacing: 1px;
+    }
+
+    /* ── Responsive ── */
+    @media (max-width: 600px) {
+      .form-grid { grid-template-columns: 1fr; }
+      .form-group.full { grid-column: 1; }
+      .card { padding: 20px; }
+    }
+
+    /* ── Divider line ── */
+    .section-divider {
+      height: 1px;
+      background: linear-gradient(90deg, transparent, var(--sol-border), transparent);
+      margin: 28px 0;
+    }
+  </style>
+</head>
+<body>
+
+<div class="orb orb-1"></div>
+<div class="orb orb-2"></div>
+
+<div class="container">
+
+  <!-- HEADER -->
+  <div class="header">
+    <div class="logo">
+      <div class="logo-icon">🔍</div>
+      <div class="logo-text">
+        <div class="logo-tag">// On-Chain Forensics</div>
+        <div class="logo-name">SolTrace</div>
+      </div>
+    </div>
+    <p class="header-desc">
+      Investigação forense blockchain para rastreamento de fundos roubados na rede Solana.
+      Detecte CEXs, identifique técnicas de ofuscação e gere relatórios de evidência.
+    </p>
+  </div>
+
+  <!-- FORM CARD -->
+  <div class="card">
+    <div class="card-title">🕵️ Nova Investigação</div>
+
+    <div class="form-grid">
+      <div class="form-group full">
+        <label>Carteira Hackeada <span class="required">*</span></label>
+        <input
+          type="text"
+          id="wallet"
+          placeholder="5tyF...xAi9 (endereço Solana base58)"
+          autocomplete="off"
+          spellcheck="false"
+        />
+        <div class="input-hint">Endereço público da carteira que foi comprometida</div>
+      </div>
+
+      <div class="form-group full">
+        <label>Token Roubado <span class="required">*</span></label>
+        <input
+          type="text"
+          id="token"
+          placeholder="USDC, SOL, BONK ou mint address completo"
+          autocomplete="off"
+          spellcheck="false"
+        />
+        <div class="input-hint">Símbolo (USDC, SOL) ou endereço mint do token</div>
+      </div>
+
+      <div class="form-group">
+        <label>Quantidade Roubada <span class="required">*</span></label>
+        <input
+          type="number"
+          id="amount"
+          placeholder="ex: 5000"
+          min="0"
+          step="any"
+        />
+      </div>
+
+      <div class="form-group">
+        <label>Nome do Token (opcional)</label>
+        <input
+          type="text"
+          id="token_name"
+          placeholder="ex: USD Coin, Solana"
+        />
+        <div class="input-hint">Nome amigável para o relatório</div>
+      </div>
+
+      <div class="form-group full">
+        <label>Hash da Transação do Roubo <span style="color:var(--sol-muted);font-weight:400">(opcional — aumenta precisão)</span></label>
+        <input
+          type="text"
+          id="tx_hash"
+          placeholder="5CcvNWRGbEGk... (assinatura da TX onde os fundos foram roubados)"
+          autocomplete="off"
+          spellcheck="false"
+        />
+        <div class="input-hint">Quando fornecido, o rastreamento parte diretamente dessa transação — elimina ambiguidade</div>
+      </div>
+    </div>
+
+    <button class="btn-investigate" id="btn-investigate" onclick="startInvestigation()">
+      <span id="btn-icon">🔍</span>
+      <span id="btn-text">Iniciar Investigação</span>
+    </button>
+
+    <!-- Error box -->
+    <div id="error-box">
+      <div class="error-title">⚠️ Erro na Investigação</div>
+      <div class="error-msg" id="error-msg"></div>
+    </div>
+  </div>
+
+  <!-- LOADING CARD -->
+  <div class="card" id="loading">
+    <div class="card-title">⚡ Investigando...</div>
+
+    <div class="progress-bar">
+      <div class="progress-fill" id="progress-fill"></div>
+    </div>
+
+    <div class="loading-steps">
+      <div class="step" id="step-1">
+        <div class="step-icon">🌐</div>
+        <div>
+          <div class="step-label">Conectando à blockchain Solana</div>
+          <div class="step-sub">Buscando histórico de transações via Helius API</div>
+        </div>
+      </div>
+      <div class="step" id="step-2">
+        <div class="step-icon">🗺️</div>
+        <div>
+          <div class="step-label">Mapeando fluxo de fundos</div>
+          <div class="step-sub">Rastreando transferências do token especificado</div>
+        </div>
+      </div>
+      <div class="step" id="step-3">
+        <div class="step-icon">🏦</div>
+        <div>
+          <div class="step-label">Verificando exchanges (CEX)</div>
+          <div class="step-sub">Cruzando endereços com base de dados de CEXs conhecidas</div>
+        </div>
+      </div>
+      <div class="step" id="step-4">
+        <div class="step-icon">🤖</div>
+        <div>
+          <div class="step-label">SolTrace analisando evidências</div>
+          <div class="step-sub">IA forense processando dados on-chain...</div>
+        </div>
+      </div>
+      <div class="step" id="step-5">
+        <div class="step-icon">📋</div>
+        <div>
+          <div class="step-label">Gerando relatório forense</div>
+          <div class="step-sub">Estruturando evidências e recomendações</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- RESULT CARD -->
+  <div class="card" id="result">
+    <div class="card-title">📋 Relatório Forense</div>
+
+    <!-- CEX Alert (shown if CEX detected) -->
+    <div id="cex-alert" class="alert-cex" style="display:none">
+      <div class="alert-icon">🚨</div>
+      <div>
+        <div class="alert-title">FUNDOS DETECTADOS EM EXCHANGE CENTRALIZADA</div>
+        <div class="alert-body">
+          Os fundos roubados foram rastreados até uma ou mais exchanges (CEX).
+          Existe possibilidade de bloqueio formal. Verifique o template de contato no relatório abaixo.
+        </div>
+      </div>
+    </div>
+
+    <!-- Meta chips -->
+    <div class="meta-row" id="meta-chips"></div>
+
+    <div class="section-divider"></div>
+
+    <!-- Markdown content -->
+    <div class="report-content" id="report-markdown"></div>
+
+    <div class="section-divider"></div>
+
+    <!-- Actions -->
+    <div style="display:flex; gap:12px; flex-wrap:wrap; margin-top:8px">
+      <button onclick="copyReport()" style="
+        font-family: 'JetBrains Mono', monospace; font-size:12px;
+        padding:10px 20px; border-radius:8px; cursor:pointer;
+        border: 1px solid rgba(20,241,149,0.4); background: rgba(20,241,149,0.08);
+        color: var(--sol-green); transition: all 0.15s;
+      " onmouseover="this.style.background='rgba(20,241,149,0.15)'"
+         onmouseout="this.style.background='rgba(20,241,149,0.08)'">
+        ⧉ Copiar Relatório
+      </button>
+      <button onclick="newInvestigation()" style="
+        font-family: 'JetBrains Mono', monospace; font-size:12px;
+        padding:10px 20px; border-radius:8px; cursor:pointer;
+        border: 1px solid var(--sol-border); background: rgba(255,255,255,0.03);
+        color: var(--sol-muted); transition: all 0.15s;
+      " onmouseover="this.style.color='var(--sol-text)'"
+         onmouseout="this.style.color='var(--sol-muted)'">
+        ← Nova Investigação
+      </button>
+    </div>
+  </div>
+
+  <!-- FOOTER -->
+  <div class="footer">
+    <div class="footer-text">SolTrace v1.0 · Powered by OpenAI GPT-4o · Solana Blockchain Forensics</div>
+  </div>
+
+</div>
+
+<script>
+  let currentReportText = '';
+
+  // ── Marked config ──
+  marked.setOptions({
+    breaks: true,
+    gfm: true,
+  });
+
+  async function startInvestigation() {
+    const wallet = document.getElementById('wallet').value.trim();
+    const token = document.getElementById('token').value.trim();
+    const amount = parseFloat(document.getElementById('amount').value);
+    const tokenName = document.getElementById('token_name').value.trim();
+    const txHash = document.getElementById('tx_hash').value.trim();
+
+    // Validations
+    hideError();
+    if (!wallet || wallet.length < 32) {
+      showError('Endereço de carteira inválido. Informe um endereço Solana válido (mínimo 32 caracteres).');
+      return;
+    }
+    if (!token) {
+      showError('Informe o token roubado (símbolo ou endereço mint).');
+      return;
+    }
+    if (!amount || amount <= 0) {
+      showError('Informe uma quantidade roubada válida (maior que zero).');
+      return;
+    }
+
+    // UI state
+    setBtnLoading(true);
+    hideResult();
+    showLoading();
+    setProgress(10);
+    setStep(1);
+
+    try {
+      // Animate steps
+      await delay(800);
+      setStep(2); setProgress(30);
+
+      await delay(600);
+      setStep(3); setProgress(50);
+
+      await delay(400);
+      setStep(4); setProgress(65);
+
+      // API call
+      const response = await fetch('/api/investigate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          wallet,
+          token,
+          amount,
+          token_name: tokenName || null,
+          tx_hash: txHash || null,
+        }),
+      });
+
+      setProgress(90);
+      setStep(5);
+
+      if (!response.ok) {
+        const err = await response.json();
+        throw new Error(err.detail || `Erro HTTP ${response.status}`);
+      }
+
+      const data = await response.json();
+      await delay(500);
+      setProgress(100);
+
+      displayResult(data.report, { wallet, token, amount, tokenName, txHash });
+
+    } catch (err) {
+      hideLoading();
+      setBtnLoading(false);
+      showError(err.message || 'Erro desconhecido na investigação.');
+    }
+  }
+
+  function displayResult(report, input) {
+    hideLoading();
+    setBtnLoading(false);
+
+    // CEX alert
+    const hasCex = report.has_cex || (report.graph?.cex_detected?.length > 0);
+    document.getElementById('cex-alert').style.display = hasCex ? 'flex' : 'none';
+
+    // Meta chips
+    const meta = report.metadata || {};
+    const chipsEl = document.getElementById('meta-chips');
+    chipsEl.innerHTML = '';
+
+    const methodLabel = meta.analysis_method === 'bot' ? '⚙️ BOT Rule-Based' : `🤖 IA ${meta.model || 'gpt-4o'}`;
+    const methodCls   = meta.analysis_method === 'bot' ? 'chip-green' : 'chip-purple';
+    const chips = [
+      { label: `${meta.transactions_analyzed || 0} TXs analisadas`, cls: 'chip-purple' },
+      { label: `${meta.graph_nodes || 0} endereços no grafo`, cls: 'chip-purple' },
+      { label: meta.helius_used ? 'Helius API ✓' : 'RPC Público', cls: meta.helius_used ? 'chip-green' : 'chip-orange' },
+      { label: methodLabel, cls: methodCls },
+      ...(input.txHash ? [{ label: '🎯 TX Hash fornecido', cls: 'chip-green' }] : []),
+    ];
+
+    if (meta.cex_detected?.length > 0) {
+      meta.cex_detected.forEach(cex => {
+        chips.push({ label: `⚠️ ${cex} detectada`, cls: 'chip-red' });
+      });
+    }
+
+    if (meta.bridge_detected?.length > 0) {
+      meta.bridge_detected.forEach(bridge => {
+        chips.push({ label: `🌉 ${bridge}`, cls: 'chip-orange' });
+      });
+    }
+
+    chips.forEach(c => {
+      const el = document.createElement('span');
+      el.className = `chip ${c.cls}`;
+      el.textContent = c.label;
+      chipsEl.appendChild(el);
+    });
+
+    // Render markdown
+    const markdown = report.raw_markdown || '_Relatório não disponível._';
+    currentReportText = markdown;
+    document.getElementById('report-markdown').innerHTML = marked.parse(markdown);
+
+    // Show result
+    showResult();
+    setTimeout(() => {
+      document.getElementById('result').scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }, 100);
+  }
+
+  function copyReport() {
+    if (!currentReportText) return;
+    navigator.clipboard.writeText(currentReportText).then(() => {
+      const btn = event.target;
+      const orig = btn.textContent;
+      btn.textContent = '✓ Copiado!';
+      setTimeout(() => btn.textContent = orig, 2000);
+    });
+  }
+
+  function newInvestigation() {
+    hideResult();
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+
+  // ── UI helpers ──
+
+  function setBtnLoading(loading) {
+    const btn = document.getElementById('btn-investigate');
+    const icon = document.getElementById('btn-icon');
+    const text = document.getElementById('btn-text');
+    btn.disabled = loading;
+    if (loading) {
+      icon.textContent = '⏳';
+      text.textContent = 'Investigando...';
+    } else {
+      icon.textContent = '🔍';
+      text.textContent = 'Iniciar Investigação';
+    }
+  }
+
+  function showLoading() { document.getElementById('loading').style.display = 'block'; }
+  function hideLoading() { document.getElementById('loading').style.display = 'none'; }
+  function showResult() { document.getElementById('result').style.display = 'block'; }
+  function hideResult() { document.getElementById('result').style.display = 'none'; }
+
+  function showError(msg) {
+    const box = document.getElementById('error-box');
+    document.getElementById('error-msg').textContent = msg;
+    box.style.display = 'block';
+    box.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }
+  function hideError() { document.getElementById('error-box').style.display = 'none'; }
+
+  function setProgress(pct) {
+    document.getElementById('progress-fill').style.width = pct + '%';
+  }
+
+  function setStep(n) {
+    for (let i = 1; i <= 5; i++) {
+      const el = document.getElementById(`step-${i}`);
+      el.classList.remove('active', 'done');
+      if (i < n) el.classList.add('done');
+      else if (i === n) el.classList.add('active');
+    }
+  }
+
+  function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
+</script>
+</body>
+</html>
