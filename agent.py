@@ -1,6 +1,6 @@
 """
 SolTrace - Agente de Investigação On-Chain para Solana.
-Powered by Groq (Llama 3.3 70B) — API compatível com OpenAI, free tier.
+Powered by OpenAI GPT-4o-mini.
 """
 
 import os
@@ -192,22 +192,16 @@ Evidências on-chain disponíveis mediante solicitação.
 """
 
 
-GROQ_BASE_URL = "https://api.groq.com/openai/v1"
-GROQ_DEFAULT_MODEL = "llama-3.3-70b-versatile"
-
-
 class SolTraceAgent:
     def __init__(self):
-        self.model = os.getenv("GROQ_MODEL", GROQ_DEFAULT_MODEL)
-        # Client criado lazily para não falhar na inicialização sem API key
+        self.model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
         self._client: Optional[AsyncOpenAI] = None
 
     @property
     def client(self) -> AsyncOpenAI:
         if self._client is None:
             self._client = AsyncOpenAI(
-                api_key=os.getenv("GROQ_API_KEY"),
-                base_url=GROQ_BASE_URL,
+                api_key=os.getenv("OPENAI_API_KEY"),
             )
         return self._client
 
@@ -238,7 +232,7 @@ class SolTraceAgent:
             )
             raw_content = response.choices[0].message.content or ""
         except Exception as e:
-            raw_content = f"**Erro ao consultar Groq:** {e}\n\nVerifique sua GROQ_API_KEY no arquivo .env"
+            raw_content = f"**Erro ao consultar OpenAI:** {e}\n\nVerifique sua OPENAI_API_KEY no Render (Environment Variables)."
 
         return {
             "raw_markdown": raw_content,
