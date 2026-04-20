@@ -145,14 +145,14 @@ class InvestigationOrchestrator:
 
         # Step 3: Execute analysis
         if use_ai:
-            if not os.getenv("GROQ_API_KEY"):
+            if not os.getenv("OPENAI_API_KEY"):
                 # Graceful fallback: sem API key, usa BOT com aviso
-                print("[Orchestrator] ⚠️  GROQ_API_KEY não configurada — forçando análise BOT.")
-                print("[Orchestrator]    Adicione GROQ_API_KEY no arquivo .env para habilitar a IA.")
-                routing_reason += " [AVISO: IA indisponível — GROQ_API_KEY ausente no .env. Configure para habilitar análise por Agente de IA]"
+                print("[Orchestrator] ⚠️  OPENAI_API_KEY não configurada — forçando análise BOT.")
+                print("[Orchestrator]    Adicione OPENAI_API_KEY no Render (Environment Variables) para habilitar a IA.")
+                routing_reason += " [AVISO: IA indisponível — OPENAI_API_KEY ausente. Configure no Render para habilitar análise por Agente de IA]"
                 use_ai = False
             else:
-                print(f"[Orchestrator] ✅ Escalando para Agente IA (GROQ model: {os.getenv('GROQ_MODEL', 'llama-3.3-70b-versatile')})")
+                print(f"[Orchestrator] ✅ Escalando para Agente IA (OpenAI model: {os.getenv('OPENAI_MODEL', 'gpt-4o-mini')})")
 
         if use_ai:
             report = await self.agent.investigate(
