@@ -46,7 +46,7 @@ class InvestigationRequest(BaseModel):
     token: str                          # mint address OU símbolo (ex: "USDC", "SOL")
     amount: float
     token_name: Optional[str] = None    # nome amigável opcional
-    tx_hash: Optional[str] = None       # hash da TX do roubo (opcional, aumenta precisão)
+    tx_hash: str      # hash da TX do roubo 
     max_hops: Optional[int] = Field(default=10, ge=1, le=15)  # profundidade do rastreamento
 
 
