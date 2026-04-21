@@ -1,9 +1,7 @@
 """
 SolTrace - Módulo de coleta de dados on-chain da Solana.
-Fontes de dados em ordem de prioridade:
-  1. Helius Enhanced Transactions API (dados mais ricos, requer API key)
-  2. Solscan Public API (dados parseados, gratuito, sem key necessária)
-  3. Solana RPC público (dados brutos, sempre disponível)
+Rastreia fundos até pararem de se mover — sem limite rígido de hops.
+Detecta: CEX, DEX swap, Bridge, carteiras estacionadas (PARKED), splits (1→N).
 """
 
 import httpx
@@ -13,24 +11,26 @@ from datetime import datetime
 
 from cex_database import (
     CEX_ADDRESSES, BRIDGE_PROGRAMS, DEFI_PROGRAMS, CEX_NAME_PATTERNS,
-    ALL_DEX_PROGRAMS, ALL_KNOWN_PROGRAMS,
+    ALL_DEX_PROGRAMS,
     is_cex_address, is_dex_program, is_bridge_program,
     detect_cex_from_label, get_entity_info, classify_address,
 )
 
-HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "")
-HELIUS_BASE_URL = "https://api.helius.xyz/v0"
-
-SOLSCAN_API_KEY = os.getenv("SOLSCAN_API_KEY", "")
+HELIUS_API_KEY   = os.getenv("HELIUS_API_KEY", "")
+HELIUS_BASE_URL  = "https://api.helius.xyz/v0"
+SOLSCAN_API_KEY  = os.getenv("SOLSCAN_API_KEY", "")
 SOLSCAN_BASE_URL = "https://public-api.solscan.io"
-SOLSCAN_PRO_URL = "https://pro-api.solscan.io/v2.0"
+SOLSCAN_PRO_URL  = "https://pro-api.solscan.io/v2.0"
+SOLANA_RPC_URL   = "https://api.mainnet-beta.solana.com"
 
-SOLANA_RPC_URL = "https://api.mainnet-beta.solana.com"
-
-SOL_MINT = "So11111111111111111111111111111111111111112"
+SOL_MINT    = "So11111111111111111111111111111111111111112"
 SOL_SYMBOLS = {"sol", "solana", SOL_MINT.lower()}
 
-# Helius `source` field -> (DEX display name, program ID)
+# Limites de segurança para evitar explosão de BFS
+MAX_BFS_WALLETS   = 80   # máximo de carteiras únicas rastreadas
+MAX_OUTGOING_NODE = 15   # máximo de saídas por carteira (splits)
+MAX_BFS_DEPTH     = 20   # profundidade máxima absoluta de segurança
+
 HELIUS_SOURCE_TO_DEX: dict[str, tuple[str, str]] = {
     "JUPITER":   ("Jupiter Aggregator v6",  "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"),
     "RAYDIUM":   ("Raydium AMM v4",          "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"),
@@ -49,113 +49,105 @@ HELIUS_SOURCE_TO_DEX: dict[str, tuple[str, str]] = {
 
 def _classify_dest(address: str) -> dict:
     info = classify_address(address)
-    if info["is_cex"]:    node_type = "CEX"
-    elif info["is_bridge"]: node_type = "BRIDGE"
-    elif info["is_dex"]:  node_type = "DEX_SWAP"
-    elif info["is_defi"]: node_type = "DEFI"
-    else:                 node_type = "WALLET"
+    if info["is_cex"]:      nt = "CEX"
+    elif info["is_bridge"]: nt = "BRIDGE"
+    elif info["is_dex"]:    nt = "DEX_SWAP"
+    elif info["is_defi"]:   nt = "DEFI"
+    else:                   nt = "WALLET"
     return {
-        "is_cex":    info["is_cex"],
-        "is_dex":    info["is_dex"],
-        "is_bridge": info["is_bridge"],
-        "is_defi":   info["is_defi"],
-        "label":     info.get("name") or "Wallet Destino",
-        "node_type": node_type,
-        "risk":      info.get("risk", "UNKNOWN"),
+        "is_cex": info["is_cex"], "is_dex": info["is_dex"],
+        "is_bridge": info["is_bridge"], "is_defi": info["is_defi"],
+        "label": info.get("name") or "Wallet Destino",
+        "node_type": nt, "risk": info.get("risk", "UNKNOWN"),
     }
 
 
 class SolanaFetcher:
     def __init__(self):
-        self.helius_key    = HELIUS_API_KEY
-        self.use_helius    = bool(HELIUS_API_KEY)
-        self.solscan_key   = SOLSCAN_API_KEY
+        self.helius_key      = HELIUS_API_KEY
+        self.use_helius      = bool(HELIUS_API_KEY)
+        self.solscan_key     = SOLSCAN_API_KEY
         self.use_solscan_pro = bool(SOLSCAN_API_KEY)
 
     def _solscan_headers(self) -> dict:
         return {"token": self.solscan_key} if self.use_solscan_pro else {}
 
     # ─────────────────────────────────────────────────────────────────────────
-    # DEX Swap Detection
+    # DEX Detection
     # ─────────────────────────────────────────────────────────────────────────
 
     def _is_dex_swap_tx(self, tx: dict) -> tuple[bool, str, str]:
-        """
-        Detecta se uma transação é um swap em DEX.
-        Retorna (is_swap, dex_name, dex_program_id).
-
-        Camada 1: Helius type="SWAP" + source field
-        Camada 2: source field sozinho (ex: "JUPITER")
-        Camada 3: accountKeys contém program ID de DEX (fallback RPC/Solscan)
-        """
-        tx_type   = (tx.get("type")   or "").upper().strip()
-        tx_source = (tx.get("source") or "").upper().strip()
-
-        if tx_source in HELIUS_SOURCE_TO_DEX:
-            name, pid = HELIUS_SOURCE_TO_DEX[tx_source]
+        src = (tx.get("source") or "").upper().strip()
+        typ = (tx.get("type")   or "").upper().strip()
+        if src in HELIUS_SOURCE_TO_DEX:
+            name, pid = HELIUS_SOURCE_TO_DEX[src]
             return True, name, pid
-
-        if tx_type == "SWAP":
+        if typ == "SWAP":
             return True, "DEX Swap", ""
-
-        # Camada 3: accountKeys
-        for key_entry in (tx.get("accountKeys") or []):
-            addr = key_entry if isinstance(key_entry, str) else (key_entry.get("pubkey") or "")
-            found, dex_name = is_dex_program(addr)
-            if found:
-                return True, dex_name, addr
-
+        for k in (tx.get("accountKeys") or []):
+            addr = k if isinstance(k, str) else (k.get("pubkey") or "")
+            found, dn = is_dex_program(addr)
+            if found: return True, dn, addr
         return False, "", ""
 
-    def _sum_outgoing(self, wallet_lower: str, tx: dict, is_sol: bool) -> Optional[float]:
-        """Soma o valor total saindo do wallet em uma TX (para swaps)."""
-        total = 0.0
-        found = False
-        if not is_sol:
-            for t in tx.get("tokenTransfers", []):
-                if (t.get("fromUserAccount") or "").lower() == wallet_lower:
-                    try:
-                        total += float(t.get("tokenAmount") or 0)
-                        found = True
-                    except (TypeError, ValueError):
-                        pass
-        else:
-            for n in tx.get("nativeTransfers", []):
-                if (n.get("fromUserAccount") or "").lower() == wallet_lower:
-                    try:
-                        total += float(n.get("amount") or 0) / 1e9
-                        found = True
-                    except (TypeError, ValueError):
-                        pass
+    def _get_swap_output_token(self, tx: dict, wallet: str) -> tuple[Optional[str], Optional[float]]:
+        wl = wallet.lower()
+        sw = (tx.get("events") or {}).get("swap") or {}
+        for out in (sw.get("tokenOutputs") or []):
+            u = (out.get("userAccount") or out.get("account") or "").lower()
+            if u == wl or not u:
+                m = out.get("mint") or ""
+                a = out.get("tokenAmount") or out.get("amount")
+                if m: return m, float(a) if a else None
+        no = sw.get("nativeOutput")
+        if no:
+            u = (no.get("account") or "").lower()
+            if u == wl or not u:
+                ra = no.get("amount", 0)
+                return "SOL", ra / 1e9 if ra else None
+        for t in tx.get("tokenTransfers", []):
+            to = (t.get("toUserAccount") or "").lower()
+            fr = (t.get("fromUserAccount") or "").lower()
+            if to == wl and fr != wl:
+                m = t.get("mint") or ""
+                a = t.get("tokenAmount")
+                if m: return m, float(a) if a else None
+        for n in tx.get("nativeTransfers", []):
+            to = (n.get("toUserAccount") or "").lower()
+            fr = (n.get("fromUserAccount") or "").lower()
+            if to == wl and fr != wl and n.get("amount", 0) > 5000:
+                return "SOL", n["amount"] / 1e9
+        return None, None
+
+    def _sum_outgoing(self, wl: str, tx: dict, is_sol: bool) -> Optional[float]:
+        total, found = 0.0, False
+        for t in tx.get("nativeTransfers" if is_sol else "tokenTransfers", []):
+            if (t.get("fromUserAccount") or "").lower() == wl:
+                try:
+                    v = float(t.get("amount") or 0) / 1e9 if is_sol else float(t.get("tokenAmount") or 0)
+                    total += v; found = True
+                except: pass
         return total if found else None
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Busca de transações (Helius -> Solscan -> RPC)
+    # Busca de transações
     # ─────────────────────────────────────────────────────────────────────────
 
     async def get_wallet_transactions(self, wallet: str, limit: int = 50) -> list[dict]:
         if self.use_helius:
             txs = await self._helius_get_transactions(wallet, limit)
-            if txs:
-                return txs
-            print("[Fetcher] Helius falhou, tentando Solscan...")
+            if txs: return txs
         txs = await self._solscan_get_wallet_transactions(wallet, limit)
-        if txs:
-            return txs
-        print("[Fetcher] Solscan falhou, usando RPC público...")
+        if txs: return txs
         return await self._rpc_get_transactions(wallet, limit)
 
     async def _helius_get_transactions(self, wallet: str, limit: int) -> list[dict]:
-        url = f"{HELIUS_BASE_URL}/addresses/{wallet}/transactions"
-        params = {"api-key": self.helius_key, "limit": min(limit, 100)}
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=30) as c:
             try:
-                resp = await client.get(url, params=params)
-                if resp.status_code == 200:
-                    return resp.json()
-                print(f"[Helius] HTTP {resp.status_code}: {resp.text[:200]}")
-            except Exception as e:
-                print(f"[Helius] Erro: {e}")
+                r = await c.get(f"{HELIUS_BASE_URL}/addresses/{wallet}/transactions",
+                                params={"api-key": self.helius_key, "limit": min(limit, 100)})
+                if r.status_code == 200: return r.json()
+            except Exception as e: print(f"[Helius] {e}")
         return []
 
     async def _solscan_get_wallet_transactions(self, wallet: str, limit: int) -> list[dict]:
@@ -165,229 +157,177 @@ class SolanaFetcher:
         else:
             url = f"{SOLSCAN_BASE_URL}/account/transactions"
             params = {"account": wallet, "limit": min(limit, 50)}
-
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=30) as c:
             try:
-                resp = await client.get(url, params=params, headers=self._solscan_headers())
-                if resp.status_code == 200:
-                    data  = resp.json()
+                r = await c.get(url, params=params, headers=self._solscan_headers())
+                if r.status_code == 200:
+                    data = r.json()
                     items = data.get("data", data) if isinstance(data, dict) else data
-                    if isinstance(items, list):
-                        return [self._parse_solscan_tx(tx) for tx in items if tx]
-                print(f"[Solscan] HTTP {resp.status_code}: {resp.text[:200]}")
-            except Exception as e:
-                print(f"[Solscan] Erro wallet TXs: {e}")
+                    if isinstance(items, list): return [self._parse_solscan_tx(t) for t in items if t]
+            except Exception as e: print(f"[Solscan] {e}")
         return []
 
     async def _solscan_get_transaction(self, tx_hash: str) -> Optional[dict]:
         if self.use_solscan_pro:
-            url    = f"{SOLSCAN_PRO_URL}/transaction/detail"
-            params = {"tx": tx_hash}
+            url = f"{SOLSCAN_PRO_URL}/transaction/detail"; params = {"tx": tx_hash}
         else:
-            url    = f"{SOLSCAN_BASE_URL}/transaction/{tx_hash}"
-            params = {}
-
-        async with httpx.AsyncClient(timeout=30) as client:
+            url = f"{SOLSCAN_BASE_URL}/transaction/{tx_hash}"; params = {}
+        async with httpx.AsyncClient(timeout=30) as c:
             try:
-                resp = await client.get(url, params=params, headers=self._solscan_headers())
-                if resp.status_code == 200:
-                    data = resp.json()
-                    raw  = data.get("data", data) if isinstance(data, dict) and "data" in data else data
-                    if raw and isinstance(raw, dict):
-                        return self._parse_solscan_tx(raw, tx_hash)
-                print(f"[Solscan] TX HTTP {resp.status_code}")
-            except Exception as e:
-                print(f"[Solscan] Erro TX {tx_hash[:20]}: {e}")
+                r = await c.get(url, params=params, headers=self._solscan_headers())
+                if r.status_code == 200:
+                    data = r.json()
+                    raw = data.get("data", data) if isinstance(data, dict) and "data" in data else data
+                    if raw and isinstance(raw, dict): return self._parse_solscan_tx(raw, tx_hash)
+            except Exception as e: print(f"[Solscan TX] {e}")
         return None
 
-    def _parse_solscan_tx(self, tx: dict, override_sig: str = "") -> dict:
-        sig = override_sig or tx.get("txHash") or tx.get("signature") or tx.get("tx") or ""
-        ts  = tx.get("blockTime") or tx.get("block_time") or 0
-        token_transfers  = []
-        native_transfers = []
-
+    def _parse_solscan_tx(self, tx: dict, sig: str = "") -> dict:
+        sig   = sig or tx.get("txHash") or tx.get("signature") or tx.get("tx") or ""
+        ts    = tx.get("blockTime") or tx.get("block_time") or 0
+        tts, nts = [], []
         for t in tx.get("tokenTransfers", []):
-            source  = t.get("sourceOwner") or t.get("source") or ""
-            dest    = t.get("destinationOwner") or t.get("destination") or ""
-            ti      = t.get("token") or {}
-            decimals = int(ti.get("decimals") or t.get("decimals") or 0)
-            raw_amt  = t.get("amount") or t.get("tokenAmount") or 0
-            try:
-                ui_amt = float(raw_amt) / (10 ** decimals) if decimals > 0 else float(raw_amt)
-            except:
-                ui_amt = 0.0
+            src = t.get("sourceOwner") or t.get("source") or ""
+            dst = t.get("destinationOwner") or t.get("destination") or ""
+            ti  = t.get("token") or {}
+            dec = int(ti.get("decimals") or t.get("decimals") or 0)
+            raw = t.get("amount") or t.get("tokenAmount") or 0
+            try: ui = float(raw) / (10 ** dec) if dec > 0 else float(raw)
+            except: ui = 0.0
             mint = ti.get("tokenAddress") or ti.get("address") or t.get("mint") or ""
-            if source and dest and ui_amt > 0:
-                token_transfers.append({"fromUserAccount": source, "toUserAccount": dest, "mint": mint, "tokenAmount": ui_amt})
-
+            if src and dst and ui > 0:
+                tts.append({"fromUserAccount": src, "toUserAccount": dst, "mint": mint, "tokenAmount": ui})
         for s in tx.get("solTransfers", []):
-            source   = s.get("source") or ""
-            dest     = s.get("destination") or ""
-            lamports = s.get("amount") or 0
-            if source and dest and lamports > 5000:
-                native_transfers.append({"fromUserAccount": source, "toUserAccount": dest, "amount": lamports})
-
-        signers   = tx.get("signer") or []
-        fee_payer = signers[0] if signers else ""
-
-        parsed = {
-            "signature": sig, "timestamp": ts,
-            "type": tx.get("txType") or "TRANSFER",
-            "source": "SOLSCAN", "description": tx.get("memo") or "",
-            "tokenTransfers": token_transfers, "nativeTransfers": native_transfers,
-            "feePayer": fee_payer, "accountKeys": [],
-        }
-
-        # Detecta DEX via programId nas instruções do Solscan
+            if s.get("source") and s.get("destination") and (s.get("amount") or 0) > 5000:
+                nts.append({"fromUserAccount": s["source"], "toUserAccount": s["destination"], "amount": s["amount"]})
+        parsed = {"signature": sig, "timestamp": ts, "type": tx.get("txType") or "TRANSFER",
+                  "source": "SOLSCAN", "description": tx.get("memo") or "",
+                  "tokenTransfers": tts, "nativeTransfers": nts,
+                  "feePayer": (tx.get("signer") or [""])[0], "accountKeys": []}
         for instr in (tx.get("parsedInstruction") or tx.get("instructions") or []):
             pid = instr.get("programId") or instr.get("program") or ""
-            found, dex_name = is_dex_program(pid)
+            found, dn = is_dex_program(pid)
             if found:
-                parsed["type"]   = "SWAP"
-                parsed["source"] = dex_name.split()[0].upper()
-                parsed["accountKeys"] = [pid]
-                break
-
+                parsed["type"] = "SWAP"; parsed["source"] = dn.split()[0].upper()
+                parsed["accountKeys"] = [pid]; break
         return parsed
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # RPC público (fallback)
-    # ─────────────────────────────────────────────────────────────────────────
-
     async def _rpc_get_transactions(self, wallet: str, limit: int) -> list[dict]:
-        signatures   = await self._rpc_get_signatures(wallet, limit)
-        transactions = []
-        async with httpx.AsyncClient(timeout=30) as client:
-            for sig_info in signatures[:20]:
-                sig = sig_info.get("signature")
-                if not sig:
-                    continue
+        sigs = await self._rpc_get_signatures(wallet, limit)
+        txs = []
+        async with httpx.AsyncClient(timeout=30) as c:
+            for si in sigs[:20]:
+                sig = si.get("signature")
+                if not sig: continue
                 try:
-                    payload = {"jsonrpc": "2.0", "id": 1, "method": "getTransaction",
-                               "params": [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]}
-                    resp = await client.post(SOLANA_RPC_URL, json=payload)
-                    if resp.status_code == 200:
-                        result = resp.json().get("result")
-                        if result:
-                            transactions.append(self._parse_rpc_transaction(result, sig))
-                except Exception as e:
-                    print(f"[RPC] Erro tx {sig[:20]}: {e}")
-        return transactions
+                    r = await c.post(SOLANA_RPC_URL, json={"jsonrpc":"2.0","id":1,"method":"getTransaction",
+                        "params":[sig,{"encoding":"jsonParsed","maxSupportedTransactionVersion":0}]})
+                    if r.status_code == 200:
+                        res = r.json().get("result")
+                        if res: txs.append(self._parse_rpc_transaction(res, sig))
+                except: pass
+        return txs
 
     async def _rpc_get_signatures(self, wallet: str, limit: int) -> list[dict]:
-        payload = {"jsonrpc": "2.0", "id": 1, "method": "getSignaturesForAddress", "params": [wallet, {"limit": limit}]}
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with httpx.AsyncClient(timeout=20) as c:
             try:
-                resp = await client.post(SOLANA_RPC_URL, json=payload)
-                if resp.status_code == 200:
-                    return resp.json().get("result", [])
-            except Exception as e:
-                print(f"[RPC] Erro getSignaturesForAddress: {e}")
+                r = await c.post(SOLANA_RPC_URL, json={"jsonrpc":"2.0","id":1,"method":"getSignaturesForAddress","params":[wallet,{"limit":limit}]})
+                if r.status_code == 200: return r.json().get("result", [])
+            except: pass
         return []
 
     def _parse_rpc_transaction(self, tx_data: dict, signature: str) -> dict:
-        meta        = tx_data.get("meta", {}) or {}
-        message     = tx_data.get("transaction", {}).get("message", {})
-        block_time  = tx_data.get("blockTime", 0)
-        account_keys = [a.get("pubkey", "") for a in message.get("accountKeys", [])]
-
-        # Detecta DEX via accountKeys
-        detected_dex_name = ""
-        detected_dex_pid  = ""
-        for addr in account_keys:
-            found, dex_name = is_dex_program(addr)
-            if found:
-                detected_dex_name = dex_name
-                detected_dex_pid  = addr
-                print(f"[RPC] DEX via accountKeys: {dex_name}")
-                break
-
-        token_transfers  = []
-        native_transfers = []
+        meta = tx_data.get("meta", {}) or {}
+        msg  = tx_data.get("transaction", {}).get("message", {})
+        blt  = tx_data.get("blockTime", 0)
+        aks  = [a.get("pubkey", "") for a in msg.get("accountKeys", [])]
+        dex_name, dex_pid = "", ""
+        for addr in aks:
+            f, dn = is_dex_program(addr)
+            if f: dex_name = dn; dex_pid = addr; break
+        tts, nts = [], []
         from collections import defaultdict
-        pre_tb  = {b["accountIndex"]: b for b in (meta.get("preTokenBalances")  or [])}
-        post_tb = {b["accountIndex"]: b for b in (meta.get("postTokenBalances") or [])}
-        mint_out: dict = defaultdict(list)
-        mint_in:  dict = defaultdict(list)
-
-        for idx in set(pre_tb) | set(post_tb):
-            pre  = pre_tb.get(idx, {})
-            post = post_tb.get(idx, {})
-            pre_a  = float((pre.get("uiTokenAmount")  or {}).get("uiAmount") or 0)
-            post_a = float((post.get("uiTokenAmount") or {}).get("uiAmount") or 0)
-            diff   = post_a - pre_a
-            if abs(diff) < 1e-9:
-                continue
-            owner = post.get("owner") or pre.get("owner") or (account_keys[idx] if idx < len(account_keys) else "unknown")
-            mint  = post.get("mint") or pre.get("mint") or ""
-            (mint_out if diff < 0 else mint_in)[mint].append({"owner": owner, "amount": abs(diff)})
-
-        for mint in set(mint_out) | set(mint_in):
-            outs = mint_out.get(mint, [])
-            ins  = mint_in.get(mint,  [])
-            used: set = set()
+        ptb = {b["accountIndex"]: b for b in (meta.get("preTokenBalances") or [])}
+        pptb= {b["accountIndex"]: b for b in (meta.get("postTokenBalances") or [])}
+        mo: dict = defaultdict(list); mi: dict = defaultdict(list)
+        for idx in set(ptb) | set(pptb):
+            pre = ptb.get(idx, {}); post = pptb.get(idx, {})
+            pa  = float((pre.get("uiTokenAmount")  or {}).get("uiAmount") or 0)
+            ppa = float((post.get("uiTokenAmount") or {}).get("uiAmount") or 0)
+            d   = ppa - pa
+            if abs(d) < 1e-9: continue
+            own  = post.get("owner") or pre.get("owner") or (aks[idx] if idx < len(aks) else "unknown")
+            mint = post.get("mint") or pre.get("mint") or ""
+            (mo if d < 0 else mi)[mint].append({"owner": own, "amount": abs(d)})
+        for mint in set(mo) | set(mi):
+            outs = mo.get(mint, []); ins = mi.get(mint, []); used: set = set()
             for out in outs:
-                best_i, best_d = None, float("inf")
+                bi, bd = None, float("inf")
                 for i, inc in enumerate(ins):
                     if i in used: continue
-                    d = abs(inc["amount"] - out["amount"])
-                    if d < best_d: best_d = d; best_i = i
-                to_owner = ins[best_i]["owner"] if best_i is not None else ""
-                if best_i is not None: used.add(best_i)
-                token_transfers.append({"fromUserAccount": out["owner"], "toUserAccount": to_owner, "mint": mint, "tokenAmount": out["amount"]})
+                    dv = abs(inc["amount"] - out["amount"])
+                    if dv < bd: bd = dv; bi = i
+                tow = ins[bi]["owner"] if bi is not None else ""
+                if bi is not None: used.add(bi)
+                tts.append({"fromUserAccount": out["owner"], "toUserAccount": tow, "mint": mint, "tokenAmount": out["amount"]})
             for i, inc in enumerate(ins):
-                if i not in used:
-                    token_transfers.append({"fromUserAccount": "", "toUserAccount": inc["owner"], "mint": mint, "tokenAmount": inc["amount"]})
-
-        pre_b  = meta.get("preBalances",  [])
-        post_b = meta.get("postBalances", [])
-        sol_s, sol_r = [], []
-        for i, (pb, ppb) in enumerate(zip(pre_b, post_b)):
-            diff = ppb - pb
-            if abs(diff) <= 5000 or i >= len(account_keys): continue
-            (sol_s if diff < 0 else sol_r).append({"acct": account_keys[i], "amount": abs(diff)})
-        used_r: set = set()
-        for sender in sol_s:
-            best_i, best_d = None, float("inf")
-            for i, recv in enumerate(sol_r):
-                if i in used_r: continue
-                d = abs(recv["amount"] - sender["amount"])
-                if d < best_d: best_d = d; best_i = i
-            to_acct = sol_r[best_i]["acct"] if best_i is not None else ""
-            if best_i is not None: used_r.add(best_i)
-            native_transfers.append({"fromUserAccount": sender["acct"], "toUserAccount": to_acct, "amount": sender["amount"]})
-
+                if i not in used: tts.append({"fromUserAccount": "", "toUserAccount": inc["owner"], "mint": mint, "tokenAmount": inc["amount"]})
+        pb = meta.get("preBalances", []); ppb = meta.get("postBalances", [])
+        ss, sr = [], []
+        for i, (a, b) in enumerate(zip(pb, ppb)):
+            d = b - a
+            if abs(d) <= 5000 or i >= len(aks): continue
+            (ss if d < 0 else sr).append({"acct": aks[i], "amount": abs(d)})
+        ur: set = set()
+        for s in ss:
+            bi, bd = None, float("inf")
+            for i, r in enumerate(sr):
+                if i in ur: continue
+                d = abs(r["amount"] - s["amount"])
+                if d < bd: bd = d; bi = i
+            ta = sr[bi]["acct"] if bi is not None else ""
+            if bi is not None: ur.add(bi)
+            nts.append({"fromUserAccount": s["acct"], "toUserAccount": ta, "amount": s["amount"]})
         return {
-            "signature": signature, "timestamp": block_time,
-            "type":   "SWAP"         if detected_dex_name else "TRANSFER",
-            "source": detected_dex_name.split()[0].upper() if detected_dex_name else "SYSTEM_PROGRAM",
-            "description": "", "tokenTransfers": token_transfers, "nativeTransfers": native_transfers,
-            "feePayer": account_keys[0] if account_keys else "",
-            "accountKeys": account_keys,
-            "_dex_name": detected_dex_name, "_dex_pid": detected_dex_pid,
+            "signature": signature, "timestamp": blt,
+            "type":   "SWAP"       if dex_name else "TRANSFER",
+            "source": dex_name.split()[0].upper() if dex_name else "SYSTEM_PROGRAM",
+            "description": "", "tokenTransfers": tts, "nativeTransfers": nts,
+            "feePayer": aks[0] if aks else "", "accountKeys": aks,
+            "_dex_name": dex_name, "_dex_pid": dex_pid,
         }
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Rastreamento de fluxo de fundos
+    # Rastreamento — segue até os fundos pararem
     # ─────────────────────────────────────────────────────────────────────────
 
     async def trace_token_flow(self, wallet: str, token: str, amount: float,
-                               transactions: list[dict], max_hops: int = 2,
+                               transactions: list[dict], max_hops: int = 20,
                                tx_hash: Optional[str] = None) -> dict:
+        """
+        Rastreia fundos até pararem de se mover.
+        Para em: CEX, Bridge, DEX (depois continua com token de saída),
+                 carteira PARKED (sem saídas), ou limites de segurança.
+        Detecta: splits (1→N), fundos estacionados, padrões de lavagem.
+        """
         graph = {
             "nodes": [{"id": wallet, "label": "Carteira Hackeada (Vítima)", "type": "VICTIM",
-                       "is_cex": False, "is_dex": False, "is_bridge": False, "is_defi": False, "depth": 0}],
-            "edges": [], "cex_detected": [], "bridge_detected": [], "dex_detected": [], "summary": {},
+                       "is_cex": False, "is_dex": False, "is_bridge": False,
+                       "is_defi": False, "is_parked": False, "depth": 0}],
+            "edges": [], "cex_detected": [], "bridge_detected": [],
+            "dex_detected": [], "parked_wallets": [], "summary": {},
         }
-        token_lower = token.lower().strip()
-        visited: set[str] = {wallet}
 
-        # HOP 0->1
+        token_lower = token.lower().strip()
+        # visited: "wallet:mint" — permite re-visitar com token diferente pós-swap
+        visited: set[str] = {f"{wallet}:{token_lower}"}
+
+        # ── HOP 0→1 ──────────────────────────────────────────────────────────
         if tx_hash:
-            print(f"[Fetcher] Modo TX Hash: {tx_hash}")
+            print(f"[Fetcher] TX Hash: {tx_hash}")
             tx_transfers = await self._transfers_from_tx_hash(wallet, token_lower, tx_hash)
             if not tx_transfers:
-                print(f"[Fetcher] ERRO: TX {tx_hash[:30]}... não encontrada.")
+                print(f"[Fetcher] ERRO: TX não encontrada.")
                 outgoing = []
             elif len(tx_transfers) == 1:
                 outgoing = tx_transfers
@@ -397,102 +337,200 @@ class SolanaFetcher:
             outgoing = self._best_match_transfers(wallet, token_lower, transactions, amount)
 
         actual_mint = next(
-            (tx["mint"].lower() for tx in outgoing if tx.get("mint") and tx["mint"].lower() != "sol"),
+            (t["mint"].lower() for t in outgoing if t.get("mint") and t["mint"].lower() != "sol"),
             token_lower,
         )
-        print(f"[Fetcher] Mint HOP 0->1: {actual_mint}")
+        print(f"[Fetcher] Mint inicial: {actual_mint}")
 
-        bfs_queue: list[tuple[str, object, int, int]] = []
+        # BFS: (wallet, received_amount, received_ts, depth, current_mint)
+        bfs_queue: list[tuple[str, object, int, int, str]] = []
 
         for tx in outgoing:
             dest = tx.get("to")
-            if not dest or dest == wallet:
-                continue
-            classification = _classify_dest(dest)
-            if not classification["is_cex"] and not classification["is_dex"] and not classification["is_bridge"] and self.use_helius:
-                lbl = await self._helius_get_entity_label(dest)
-                if lbl:
-                    ok, name = detect_cex_from_label(lbl)
-                    if ok:
-                        classification.update({"is_cex": True, "label": name, "node_type": "CEX"})
-            self._update_node(graph, dest, classification, 1)
+            if not dest or dest == wallet: continue
+            cls = await self._classify_and_enrich(dest)
+            self._update_node(graph, dest, cls, 1)
             self._add_edge(graph, wallet, dest, tx)
-            self._update_detections(graph, classification)
-            if not (classification["is_cex"] or classification["is_bridge"] or classification["is_dex"] or classification["is_defi"]) and dest not in visited:
-                bfs_queue.append((dest, tx.get("amount"), tx.get("timestamp") or 0, 1))
+            self._update_detections(graph, cls)
+            vkey = f"{dest}:{actual_mint}"
+            if not self._is_terminal(cls) and vkey not in visited:
+                visited.add(vkey)
+                bfs_queue.append((dest, tx.get("amount"), tx.get("timestamp") or 0, 1, actual_mint))
 
-        # BFS
+        # ── BFS principal ─────────────────────────────────────────────────────
+        total_processed = 0
         while bfs_queue:
-            hop_wallet, recv_amount, recv_ts, depth = bfs_queue.pop(0)
-            if depth >= max_hops or hop_wallet in visited:
+            hop_wallet, recv_amount, recv_ts, depth, current_mint = bfs_queue.pop(0)
+
+            # Limites de segurança
+            if total_processed >= MAX_BFS_WALLETS:
+                print(f"[Fetcher] Limite de segurança: {MAX_BFS_WALLETS} carteiras processadas.")
+                self._mark_node_truncated(graph, hop_wallet)
                 continue
-            visited.add(hop_wallet)
-            print(f"[Fetcher] BFS {depth}→{depth+1}: {hop_wallet[:20]}...")
+            if depth >= MAX_BFS_DEPTH:
+                print(f"[Fetcher] Profundidade máxima atingida: {hop_wallet[:20]}...")
+                continue
 
-            hop_txs = await self.get_wallet_transactions(hop_wallet, limit=20)
-            hop_out = self._extract_outgoing_transfers(hop_wallet, actual_mint, hop_txs,
-                                                       min_timestamp=recv_ts, received_amount=recv_amount)
+            total_processed += 1
+            print(f"[Fetcher] BFS {depth}→{depth+1} [{total_processed}/{MAX_BFS_WALLETS}]: {hop_wallet[:20]}... (mint={current_mint[:15]}...)")
 
-            for tx in hop_out[:5]:
-                dest = tx.get("to")
-                if not dest or dest in visited:
-                    continue
+            hop_txs = await self.get_wallet_transactions(hop_wallet, limit=30)
+            hop_out = self._extract_outgoing_transfers(
+                hop_wallet, current_mint, hop_txs,
+                min_timestamp=recv_ts, received_amount=recv_amount,
+            )
 
-                # Trata DEX_SWAP sintético
-                if tx.get("transfer_type") == "DEX_SWAP":
+            # ── CARTEIRA PARKED: recebeu mas não moveu ────────────────────────
+            if not hop_out:
+                self._mark_parked(graph, hop_wallet, recv_ts)
+                if hop_wallet not in graph["parked_wallets"]:
+                    graph["parked_wallets"].append(hop_wallet)
+                print(f"[Fetcher] 🅿️ PARKED: {hop_wallet[:20]}... (sem saídas após receber)")
+                continue
+
+            # ── SPLIT: 1 carteira → N destinos ──────────────────────────────
+            if len(hop_out) > 1:
+                split_count = len([t for t in hop_out if t.get("transfer_type") != "DEX_SWAP"])
+                if split_count > 1:
+                    self._mark_split(graph, hop_wallet, split_count)
+                    print(f"[Fetcher] ⚡ SPLIT: {hop_wallet[:20]}... → {split_count} destinos")
+
+            # ── Processa saídas (até MAX_OUTGOING_NODE) ──────────────────────
+            for tx in hop_out[:MAX_OUTGOING_NODE]:
+                dest   = tx.get("to")
+                t_type = tx.get("transfer_type", "TRANSFER")
+
+                # DEX SWAP
+                if t_type == "DEX_SWAP":
                     dex_name = tx.get("dex_name", "DEX Swap")
                     node_id  = tx.get("dex_pid") or dex_name
-                    cls = {"is_cex": False, "is_dex": True, "is_bridge": False, "is_defi": False,
-                           "label": dex_name, "node_type": "DEX_SWAP", "risk": "LOW RISK"}
-                    self._update_node(graph, node_id, cls, depth + 1)
+                    dex_cls  = {
+                        "is_cex": False, "is_dex": True, "is_bridge": False,
+                        "is_defi": False, "is_parked": False,
+                        "label": dex_name, "node_type": "DEX_SWAP", "risk": "LOW RISK",
+                    }
+                    self._update_node(graph, node_id, dex_cls, depth + 1)
                     self._add_edge(graph, hop_wallet, node_id, tx)
                     if dex_name not in graph["dex_detected"]:
                         graph["dex_detected"].append(dex_name)
                     print(f"[Fetcher] 🔄 SWAP: {hop_wallet[:20]}... → {dex_name}")
+
+                    # Continua com token de saída
+                    output_mint, output_amount = tx.get("output_mint"), tx.get("output_amount")
+                    if output_mint:
+                        out_mint_lower = output_mint.lower()
+                        vkey = f"{hop_wallet}:{out_mint_lower}"
+                        if vkey not in visited and depth + 1 < MAX_BFS_DEPTH:
+                            visited.add(vkey)
+                            print(f"[Fetcher] 🔄 Pós-swap: {hop_wallet[:20]}... → {out_mint_lower[:20]}...")
+                            bfs_queue.insert(0, (hop_wallet, output_amount, tx.get("timestamp") or 0, depth + 1, out_mint_lower))
                     continue
 
-                classification = _classify_dest(dest)
-                if not classification["is_cex"] and not classification["is_dex"] and not classification["is_bridge"] and self.use_helius:
-                    lbl = await self._helius_get_entity_label(dest)
-                    if lbl:
-                        ok, name = detect_cex_from_label(lbl)
-                        if ok:
-                            classification.update({"is_cex": True, "label": name, "node_type": "CEX"})
+                # Transfer normal
+                if not dest: continue
+                vkey = f"{dest}:{current_mint}"
+                if vkey in visited: continue
 
-                self._update_node(graph, dest, classification, depth + 1)
+                cls = await self._classify_and_enrich(dest)
+                self._update_node(graph, dest, cls, depth + 1)
                 self._add_edge(graph, hop_wallet, dest, tx)
-                self._update_detections(graph, classification)
+                self._update_detections(graph, cls)
 
-                if not (classification["is_cex"] or classification["is_bridge"] or classification["is_dex"] or classification["is_defi"]):
-                    bfs_queue.append((dest, tx.get("amount"), tx.get("timestamp") or 0, depth + 1))
+                if not self._is_terminal(cls):
+                    visited.add(vkey)
+                    bfs_queue.append((dest, tx.get("amount"), tx.get("timestamp") or 0, depth + 1, current_mint))
+
+        # ── Summary ───────────────────────────────────────────────────────────
+        parked_nodes = [n for n in graph["nodes"] if n.get("is_parked")]
+        split_nodes  = [n for n in graph["nodes"] if n.get("is_split")]
 
         graph["summary"] = {
-            "total_nodes": len(graph["nodes"]), "total_edges": len(graph["edges"]),
-            "max_depth":   max((n["depth"] for n in graph["nodes"]), default=0),
-            "cex_found":   len(graph["cex_detected"]) > 0,
-            "bridge_used": len(graph["bridge_detected"]) > 0,
-            "dex_used":    len(graph["dex_detected"]) > 0,
+            "total_nodes":        len(graph["nodes"]),
+            "total_edges":        len(graph["edges"]),
+            "max_depth":          max((n["depth"] for n in graph["nodes"]), default=0),
+            "cex_found":          len(graph["cex_detected"]) > 0,
+            "bridge_used":        len(graph["bridge_detected"]) > 0,
+            "dex_used":           len(graph["dex_detected"]) > 0,
+            "parked_count":       len(parked_nodes),
+            "split_count":        len(split_nodes),
             "outgoing_transfers": len(outgoing),
+            "wallets_processed":  total_processed,
+            "truncated":          total_processed >= MAX_BFS_WALLETS,
         }
+
+        print(f"[Fetcher] Rastreamento concluído: {len(graph['nodes'])} nós | "
+              f"{len(parked_nodes)} parked | {len(split_nodes)} splits | "
+              f"CEX={graph['cex_detected']} DEX={graph['dex_detected']}")
+
         return graph
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Graph helpers
+    # Node state helpers
     # ─────────────────────────────────────────────────────────────────────────
+
+    def _mark_parked(self, graph: dict, wallet: str, recv_ts: int):
+        for n in graph["nodes"]:
+            if n["id"] == wallet:
+                n["type"]      = "PARKED"
+                n["is_parked"] = True
+                n["label"]     = f"Carteira Estacionada"
+                n["recv_ts"]   = recv_ts
+                break
+
+    def _mark_split(self, graph: dict, wallet: str, split_count: int):
+        for n in graph["nodes"]:
+            if n["id"] == wallet:
+                n["is_split"]    = True
+                n["split_count"] = split_count
+                if n.get("type") == "WALLET":
+                    n["type"]  = "SPLIT"
+                    n["label"] = f"Carteira Split ({split_count} destinos)"
+                break
+
+    def _mark_node_truncated(self, graph: dict, wallet: str):
+        for n in graph["nodes"]:
+            if n["id"] == wallet:
+                n["truncated"] = True
+                n["label"]    += " [rastreamento interrompido]"
+                break
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Classification helpers
+    # ─────────────────────────────────────────────────────────────────────────
+
+    async def _classify_and_enrich(self, dest: str) -> dict:
+        cls = _classify_dest(dest)
+        if not self._is_terminal(cls) and self.use_helius:
+            lbl = await self._helius_get_entity_label(dest)
+            if lbl:
+                ok, name = detect_cex_from_label(lbl)
+                if ok: cls.update({"is_cex": True, "label": name, "node_type": "CEX"})
+        return cls
+
+    def _is_terminal(self, cls: dict) -> bool:
+        return cls["is_cex"] or cls["is_bridge"] or cls["is_dex"] or cls["is_defi"]
 
     def _update_node(self, graph: dict, node_id: str, cls: dict, depth: int):
         if node_id not in [n["id"] for n in graph["nodes"]]:
-            graph["nodes"].append({"id": node_id, "label": cls["label"], "type": cls["node_type"],
-                                   "is_cex": cls["is_cex"], "is_dex": cls["is_dex"],
-                                   "is_bridge": cls["is_bridge"], "is_defi": cls["is_defi"], "depth": depth})
+            graph["nodes"].append({
+                "id": node_id, "label": cls["label"], "type": cls["node_type"],
+                "is_cex": cls["is_cex"], "is_dex": cls["is_dex"],
+                "is_bridge": cls["is_bridge"], "is_defi": cls["is_defi"],
+                "is_parked": False, "is_split": False, "depth": depth,
+            })
 
     def _add_edge(self, graph: dict, frm: str, to: str, tx: dict):
-        graph["edges"].append({"from": frm, "to": to, "amount": tx.get("amount"),
-                               "mint": tx.get("mint"), "timestamp": tx.get("timestamp"),
-                               "timestamp_human": self._ts_to_human(tx.get("timestamp")),
-                               "signature": tx.get("signature"),
-                               "transfer_type": tx.get("transfer_type", "TRANSFER"),
-                               "dex_name": tx.get("dex_name")})
+        graph["edges"].append({
+            "from": frm, "to": to,
+            "amount": tx.get("amount"), "mint": tx.get("mint"),
+            "timestamp": tx.get("timestamp"),
+            "timestamp_human": self._ts_to_human(tx.get("timestamp")),
+            "signature": tx.get("signature"),
+            "transfer_type": tx.get("transfer_type", "TRANSFER"),
+            "dex_name": tx.get("dex_name"),
+            "output_mint": tx.get("output_mint"),
+            "output_amount": tx.get("output_amount"),
+        })
 
     def _update_detections(self, graph: dict, cls: dict):
         lbl = cls["label"]
@@ -505,34 +543,28 @@ class SolanaFetcher:
     # ─────────────────────────────────────────────────────────────────────────
 
     async def _helius_get_entity_label(self, address: str) -> str:
-        if not self.use_helius:
-            return ""
-        url    = f"{HELIUS_BASE_URL}/addresses/{address}/transactions"
-        params = {"api-key": self.helius_key, "limit": 5}
-        async with httpx.AsyncClient(timeout=15) as client:
+        if not self.use_helius: return ""
+        async with httpx.AsyncClient(timeout=15) as c:
             try:
-                resp = await client.get(url, params=params)
-                if resp.status_code != 200:
-                    return ""
-                txs = resp.json()
-                if not txs or not isinstance(txs, list):
-                    return ""
+                r = await c.get(f"{HELIUS_BASE_URL}/addresses/{address}/transactions",
+                                params={"api-key": self.helius_key, "limit": 5})
+                if r.status_code != 200: return ""
+                txs = r.json()
+                if not txs or not isinstance(txs, list): return ""
                 for tx in txs:
-                    source = (tx.get("source") or "").strip()
-                    if source and source not in ("SYSTEM_PROGRAM", "UNKNOWN", ""):
-                        ok, name = detect_cex_from_label(source)
+                    src = (tx.get("source") or "").strip()
+                    if src and src not in ("SYSTEM_PROGRAM", "UNKNOWN", ""):
+                        ok, name = detect_cex_from_label(src)
                         if ok: return name
                     desc = (tx.get("description") or "").lower()
-                    for pattern, name in CEX_NAME_PATTERNS.items():
-                        if pattern in desc: return name
-                    for acct_data in (tx.get("accountData") or []):
-                        if (acct_data.get("account") or "").lower() == address.lower():
-                            lbl = acct_data.get("label") or acct_data.get("entity") or ""
+                    for pat, name in CEX_NAME_PATTERNS.items():
+                        if pat in desc: return name
+                    for ad in (tx.get("accountData") or []):
+                        if (ad.get("account") or "").lower() == address.lower():
+                            lbl = ad.get("label") or ad.get("entity") or ""
                             if lbl: return lbl
-                return ""
-            except Exception as e:
-                print(f"[Helius Entity] Erro {address[:20]}...: {e}")
-                return ""
+            except Exception as e: print(f"[Helius Entity] {e}")
+        return ""
 
     # ─────────────────────────────────────────────────────────────────────────
     # TX fetching
@@ -540,171 +572,136 @@ class SolanaFetcher:
 
     async def _fetch_tx_data(self, tx_hash: str) -> Optional[dict]:
         if self.use_helius:
-            url = f"{HELIUS_BASE_URL}/transactions"
-            async with httpx.AsyncClient(timeout=30) as client:
+            async with httpx.AsyncClient(timeout=30) as c:
                 try:
-                    resp = await client.post(url, params={"api-key": self.helius_key}, json={"transactions": [tx_hash]})
-                    if resp.status_code == 200:
-                        results = resp.json()
-                        if results and isinstance(results, list) and results[0]:
-                            return results[0]
-                    print(f"[Helius TX] HTTP {resp.status_code}")
-                except Exception as e:
-                    print(f"[Helius TX] Erro: {e}")
-
-        tx_data = await self._solscan_get_transaction(tx_hash)
-        if tx_data:
-            return tx_data
-
-        payload = {"jsonrpc": "2.0", "id": 1, "method": "getTransaction",
-                   "params": [tx_hash, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]}
-        async with httpx.AsyncClient(timeout=30) as client:
+                    r = await c.post(f"{HELIUS_BASE_URL}/transactions",
+                                     params={"api-key": self.helius_key},
+                                     json={"transactions": [tx_hash]})
+                    if r.status_code == 200:
+                        res = r.json()
+                        if res and isinstance(res, list) and res[0]: return res[0]
+                except Exception as e: print(f"[Helius TX] {e}")
+        tx = await self._solscan_get_transaction(tx_hash)
+        if tx: return tx
+        async with httpx.AsyncClient(timeout=30) as c:
             try:
-                resp = await client.post(SOLANA_RPC_URL, json=payload)
-                if resp.status_code == 200:
-                    result = resp.json().get("result")
-                    if result:
-                        return self._parse_rpc_transaction(result, tx_hash)
-            except Exception as e:
-                print(f"[RPC TX] Erro {tx_hash[:20]}: {e}")
+                r = await c.post(SOLANA_RPC_URL, json={"jsonrpc":"2.0","id":1,"method":"getTransaction",
+                    "params":[tx_hash,{"encoding":"jsonParsed","maxSupportedTransactionVersion":0}]})
+                if r.status_code == 200:
+                    res = r.json().get("result")
+                    if res: return self._parse_rpc_transaction(res, tx_hash)
+            except Exception as e: print(f"[RPC TX] {e}")
         return None
 
     async def _transfers_from_tx_hash(self, wallet: str, token_lower: str, tx_hash: str) -> list[dict]:
-        tx_data = await self._fetch_tx_data(tx_hash)
-        if not tx_data:
-            return []
+        tx = await self._fetch_tx_data(tx_hash)
+        if not tx: return []
         is_sol = token_lower in SOL_SYMBOLS
-        ts = tx_data.get("timestamp", 0)
-        wallet_lower = wallet.lower()
+        ts = tx.get("timestamp", 0)
+        wl = wallet.lower()
         strict: list[dict] = []
-
         if not is_sol:
-            for t in tx_data.get("tokenTransfers", []):
-                if (t.get("fromUserAccount") or "").lower() == wallet_lower and t.get("toUserAccount"):
-                    strict.append({"type": "token", "from": wallet, "to": t["toUserAccount"],
-                                   "amount": t.get("tokenAmount"), "mint": t.get("mint"), "signature": tx_hash, "timestamp": ts})
+            for t in tx.get("tokenTransfers", []):
+                if (t.get("fromUserAccount") or "").lower() == wl and t.get("toUserAccount"):
+                    strict.append({"type":"token","from":wallet,"to":t["toUserAccount"],
+                                   "amount":t.get("tokenAmount"),"mint":t.get("mint"),"signature":tx_hash,"timestamp":ts})
         else:
-            for n in tx_data.get("nativeTransfers", []):
-                if (n.get("fromUserAccount") or "").lower() == wallet_lower and n.get("toUserAccount") and n.get("amount", 0) > 0:
-                    strict.append({"type": "native", "from": wallet, "to": n["toUserAccount"],
-                                   "amount": n["amount"] / 1e9, "mint": "SOL", "signature": tx_hash, "timestamp": ts})
-
-        if strict:
-            print(f"[Fetcher] TX {tx_hash[:20]}... -> {len(strict)} saída(s) (match exato)")
-            return strict
-
+            for n in tx.get("nativeTransfers", []):
+                if (n.get("fromUserAccount") or "").lower() == wl and n.get("toUserAccount") and n.get("amount",0)>0:
+                    strict.append({"type":"native","from":wallet,"to":n["toUserAccount"],
+                                   "amount":n["amount"]/1e9,"mint":"SOL","signature":tx_hash,"timestamp":ts})
+        if strict: return strict
         broad: list[dict] = []
         if not is_sol:
-            for t in tx_data.get("tokenTransfers", []):
+            for t in tx.get("tokenTransfers", []):
                 if t.get("toUserAccount") and t.get("tokenAmount"):
-                    broad.append({"type": "token", "from": t.get("fromUserAccount") or wallet,
-                                  "to": t["toUserAccount"], "amount": t["tokenAmount"], "mint": t.get("mint"), "signature": tx_hash, "timestamp": ts})
+                    broad.append({"type":"token","from":t.get("fromUserAccount") or wallet,"to":t["toUserAccount"],
+                                  "amount":t["tokenAmount"],"mint":t.get("mint"),"signature":tx_hash,"timestamp":ts})
         else:
-            for n in tx_data.get("nativeTransfers", []):
-                if n.get("toUserAccount") and n.get("amount", 0) > 0:
-                    broad.append({"type": "native", "from": n.get("fromUserAccount") or wallet,
-                                  "to": n["toUserAccount"], "amount": n["amount"] / 1e9, "mint": "SOL", "signature": tx_hash, "timestamp": ts})
-        print(f"[Fetcher] TX {tx_hash[:20]}... -> {len(broad)} transfer(s) broad")
+            for n in tx.get("nativeTransfers", []):
+                if n.get("toUserAccount") and n.get("amount",0)>0:
+                    broad.append({"type":"native","from":n.get("fromUserAccount") or wallet,"to":n["toUserAccount"],
+                                  "amount":n["amount"]/1e9,"mint":"SOL","signature":tx_hash,"timestamp":ts})
         return broad
 
-    def _pick_best_from_list(self, transfers: list[dict], target_amount: float) -> list[dict]:
-        def pct_diff(t):
-            try: return abs(float(t.get("amount") or 0) - target_amount) / target_amount
+    def _pick_best_from_list(self, transfers: list[dict], target: float) -> list[dict]:
+        def pd(t):
+            try: return abs(float(t.get("amount") or 0) - target) / target
             except: return float("inf")
-        ranked = sorted(transfers, key=pct_diff)
-        tight  = [t for t in ranked if pct_diff(t) <= 0.30]
-        return tight if tight else [ranked[0]]
+        ranked = sorted(transfers, key=pd)
+        tight  = [t for t in ranked if pd(t) <= 0.30]
+        return tight if tight else ([ranked[0]] if ranked else [])
 
-    def _best_match_transfers(self, wallet: str, token_lower: str, transactions: list[dict], target_amount: float) -> list[dict]:
+    def _best_match_transfers(self, wallet: str, token_lower: str,
+                              transactions: list[dict], target: float) -> list[dict]:
         all_t = self._extract_outgoing_transfers(wallet, token_lower, transactions)
-        if not all_t:
-            return []
-        return self._pick_best_from_list(all_t, target_amount)
+        return self._pick_best_from_list(all_t, target) if all_t else []
 
-    def _extract_outgoing_transfers(self, wallet: str, token_lower: str, transactions: list[dict],
-                                     min_timestamp: int = 0, received_amount: Optional[float] = None,
-                                     max_amount_ratio: float = 10.0) -> list[dict]:
-        """
-        Extrai transferências de saída de um wallet.
-        Detecta TXs de DEX swap e retorna um transfer sintético DEX_SWAP
-        em vez dos endereços internos das pools.
-        """
-        transfers    = []
-        wallet_lower = wallet.lower()
-        is_sol       = token_lower in SOL_SYMBOLS
+    def _extract_outgoing_transfers(self, wallet: str, token_lower: str,
+                                    transactions: list[dict], min_timestamp: int = 0,
+                                    received_amount: Optional[float] = None,
+                                    max_amount_ratio: float = 10.0) -> list[dict]:
+        transfers = []
+        wl     = wallet.lower()
+        is_sol = token_lower in SOL_SYMBOLS
 
         for tx in transactions:
             sig = tx.get("signature", "")
             ts  = tx.get("timestamp", 0) or 0
+            if min_timestamp and ts and ts < min_timestamp: continue
 
-            if min_timestamp and ts and ts < min_timestamp:
-                continue
-
-            # ── DETECÇÃO DE SWAP ─────────────────────────────────────────────
+            # DEX swap detection
             is_swap, dex_name, dex_pid = self._is_dex_swap_tx(tx)
-
             if is_swap:
-                wallet_is_sender = (
-                    any((t.get("fromUserAccount") or "").lower() == wallet_lower for t in tx.get("tokenTransfers", []))
-                    or any((n.get("fromUserAccount") or "").lower() == wallet_lower for n in tx.get("nativeTransfers", []))
+                is_sender = (
+                    any((t.get("fromUserAccount") or "").lower() == wl for t in tx.get("tokenTransfers", []))
+                    or any((n.get("fromUserAccount") or "").lower() == wl for n in tx.get("nativeTransfers", []))
                 )
-                if wallet_is_sender:
-                    swap_amt = self._sum_outgoing(wallet_lower, tx, is_sol)
-                    if received_amount and swap_amt and swap_amt > float(received_amount) * max_amount_ratio:
-                        continue
-                    dest = dex_pid or dex_name
-                    print(f"[Fetcher] 🔄 SWAP TX {sig[:20]}... → {dex_name}")
+                if is_sender:
+                    swap_amt = self._sum_outgoing(wl, tx, is_sol)
+                    if received_amount and swap_amt and swap_amt > float(received_amount) * max_amount_ratio: continue
+                    out_mint, out_amt = self._get_swap_output_token(tx, wallet)
                     transfers.append({
                         "transfer_type": "DEX_SWAP", "type": "dex_swap",
-                        "from": wallet, "to": dest,
+                        "from": wallet, "to": dex_pid or dex_name,
                         "dex_name": dex_name, "dex_pid": dex_pid,
                         "amount": swap_amt, "mint": token_lower,
+                        "output_mint": out_mint, "output_amount": out_amt,
                         "signature": sig, "timestamp": ts,
                     })
-                    continue  # não processa transfers individuais desta TX
+                    continue
 
-            # ── TRANSFERS NORMAIS ────────────────────────────────────────────
             if not is_sol:
                 for t in tx.get("tokenTransfers", []):
-                    from_acct = (t.get("fromUserAccount") or "").lower()
-                    mint      = (t.get("mint") or "").lower()
-                    to_acct   = t.get("toUserAccount") or ""
-                    mint_match = (mint == token_lower) or (not self._looks_like_address(token_lower))
-                    if not (from_acct == wallet_lower and to_acct and mint_match):
-                        continue
-                    try:
-                        amt_f = float(t.get("tokenAmount") or 0)
-                    except:
-                        amt_f = None
-                    if received_amount and amt_f and amt_f > float(received_amount) * max_amount_ratio:
-                        continue
-                    transfers.append({"transfer_type": "TRANSFER", "type": "token", "from": wallet, "to": to_acct,
-                                      "amount": t.get("tokenAmount"), "mint": t.get("mint"), "signature": sig, "timestamp": ts})
+                    fr = (t.get("fromUserAccount") or "").lower()
+                    mn = (t.get("mint") or "").lower()
+                    to = t.get("toUserAccount") or ""
+                    mm = (mn == token_lower) or (not self._looks_like_address(token_lower))
+                    if not (fr == wl and to and mm): continue
+                    try: af = float(t.get("tokenAmount") or 0)
+                    except: af = None
+                    if received_amount and af and af > float(received_amount) * max_amount_ratio: continue
+                    transfers.append({"transfer_type":"TRANSFER","type":"token","from":wallet,"to":to,
+                                      "amount":t.get("tokenAmount"),"mint":t.get("mint"),"signature":sig,"timestamp":ts})
 
             if is_sol:
                 for n in tx.get("nativeTransfers", []):
-                    from_acct = (n.get("fromUserAccount") or "").lower()
-                    to_acct   = n.get("toUserAccount") or ""
-                    lamports  = n.get("amount", 0)
-                    if not (from_acct == wallet_lower and to_acct and lamports > 0):
-                        continue
-                    sol_amt = lamports / 1e9
-                    if received_amount and sol_amt > float(received_amount) * max_amount_ratio:
-                        continue
-                    transfers.append({"transfer_type": "TRANSFER", "type": "native", "from": wallet, "to": to_acct,
-                                      "amount": sol_amt, "mint": "SOL", "signature": sig, "timestamp": ts})
+                    fr = (n.get("fromUserAccount") or "").lower()
+                    to = n.get("toUserAccount") or ""
+                    lm = n.get("amount", 0)
+                    if not (fr == wl and to and lm > 0): continue
+                    sol = lm / 1e9
+                    if received_amount and sol > float(received_amount) * max_amount_ratio: continue
+                    transfers.append({"transfer_type":"TRANSFER","type":"native","from":wallet,"to":to,
+                                      "amount":sol,"mint":"SOL","signature":sig,"timestamp":ts})
 
         return transfers
 
     @staticmethod
-    def _looks_like_address(s: str) -> bool:
-        return 32 <= len(s) <= 50
+    def _looks_like_address(s: str) -> bool: return 32 <= len(s) <= 50
 
     @staticmethod
     def _ts_to_human(ts: Optional[int]) -> str:
-        if not ts:
-            return "desconhecido"
-        try:
-            return datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S UTC")
-        except:
-            return str(ts)
+        if not ts: return "desconhecido"
+        try: return datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S UTC")
+        except: return str(ts)
