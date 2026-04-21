@@ -1,7 +1,7 @@
 """
 SolTrace - Módulo de coleta de dados on-chain da Solana.
-Rastreia fundos até pararem de se mover — sem limite rígido de hops.
-Detecta: CEX, DEX swap, Bridge, carteiras estacionadas (PARKED), splits (1→N).
+Rastreia fundos até pararem de se mover.
+Pós-swap: processa IMEDIATAMENTE o token de saída sem re-enfileirar.
 """
 
 import httpx
@@ -11,7 +11,7 @@ from datetime import datetime
 
 from cex_database import (
     CEX_ADDRESSES, BRIDGE_PROGRAMS, DEFI_PROGRAMS, CEX_NAME_PATTERNS,
-    ALL_DEX_PROGRAMS,
+    ALL_DEX_PROGRAMS, STABLECOIN_MINTS,
     is_cex_address, is_dex_program, is_bridge_program,
     detect_cex_from_label, get_entity_info, classify_address,
 )
@@ -26,10 +26,9 @@ SOLANA_RPC_URL   = "https://api.mainnet-beta.solana.com"
 SOL_MINT    = "So11111111111111111111111111111111111111112"
 SOL_SYMBOLS = {"sol", "solana", SOL_MINT.lower()}
 
-# Limites de segurança para evitar explosão de BFS
-MAX_BFS_WALLETS   = 80   # máximo de carteiras únicas rastreadas
-MAX_OUTGOING_NODE = 15   # máximo de saídas por carteira (splits)
-MAX_BFS_DEPTH     = 20   # profundidade máxima absoluta de segurança
+MAX_BFS_WALLETS   = 80
+MAX_OUTGOING_NODE = 15
+MAX_BFS_DEPTH     = 20
 
 HELIUS_SOURCE_TO_DEX: dict[str, tuple[str, str]] = {
     "JUPITER":   ("Jupiter Aggregator v6",  "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"),
@@ -45,6 +44,12 @@ HELIUS_SOURCE_TO_DEX: dict[str, tuple[str, str]] = {
     "CREMA":     ("Crema Finance CLMM",       "CLMM9tUoggJu2wagPkkqs9eFG4BWhVBZWkP1qv3Sp7tR"),
     "SANCTUM":   ("Sanctum Router",           "5ocnV1qiCgaQR8Jb8xWnVbApfaygJ8tNoZfgPwsgx9kx"),
 }
+
+# Nomes amigáveis para mints conhecidos
+def _mint_display_name(mint: str) -> str:
+    name = STABLECOIN_MINTS.get(mint)
+    if name: return name
+    return mint[:20] + "..." if len(mint) > 20 else mint
 
 
 def _classify_dest(address: str) -> dict:
@@ -91,7 +96,13 @@ class SolanaFetcher:
         return False, "", ""
 
     def _get_swap_output_token(self, tx: dict, wallet: str) -> tuple[Optional[str], Optional[float]]:
+        """
+        Extrai o token de SAÍDA de uma TX de swap.
+        Múltiplas camadas de detecção para maior robustez.
+        """
         wl = wallet.lower()
+
+        # Camada 1: Helius events.swap
         sw = (tx.get("events") or {}).get("swap") or {}
         for out in (sw.get("tokenOutputs") or []):
             u = (out.get("userAccount") or out.get("account") or "").lower()
@@ -105,26 +116,36 @@ class SolanaFetcher:
             if u == wl or not u:
                 ra = no.get("amount", 0)
                 return "SOL", ra / 1e9 if ra else None
+
+        # Camada 2: tokenTransfers onde wallet é RECEPTOR (não remetente)
+        # Ignora a própria TX de input (fromUserAccount == wallet)
         for t in tx.get("tokenTransfers", []):
-            to = (t.get("toUserAccount") or "").lower()
-            fr = (t.get("fromUserAccount") or "").lower()
-            if to == wl and fr != wl:
+            to  = (t.get("toUserAccount")   or "").lower()
+            frm = (t.get("fromUserAccount") or "").lower()
+            if to == wl and frm != wl:
                 m = t.get("mint") or ""
                 a = t.get("tokenAmount")
-                if m: return m, float(a) if a else None
+                if m and m.lower() not in SOL_SYMBOLS:
+                    return m, float(a) if a else None
+
+        # Camada 3: SOL nativo recebido
         for n in tx.get("nativeTransfers", []):
-            to = (n.get("toUserAccount") or "").lower()
-            fr = (n.get("fromUserAccount") or "").lower()
-            if to == wl and fr != wl and n.get("amount", 0) > 5000:
+            to  = (n.get("toUserAccount")   or "").lower()
+            frm = (n.get("fromUserAccount") or "").lower()
+            if to == wl and frm != wl and n.get("amount", 0) > 5000:
                 return "SOL", n["amount"] / 1e9
+
         return None, None
 
     def _sum_outgoing(self, wl: str, tx: dict, is_sol: bool) -> Optional[float]:
         total, found = 0.0, False
-        for t in tx.get("nativeTransfers" if is_sol else "tokenTransfers", []):
+        key = "nativeTransfers" if is_sol else "tokenTransfers"
+        amt_key = "amount" if is_sol else "tokenAmount"
+        for t in tx.get(key, []):
             if (t.get("fromUserAccount") or "").lower() == wl:
                 try:
-                    v = float(t.get("amount") or 0) / 1e9 if is_sol else float(t.get("tokenAmount") or 0)
+                    v = float(t.get(amt_key) or 0)
+                    if is_sol: v /= 1e9
                     total += v; found = True
                 except: pass
         return total if found else None
@@ -179,12 +200,12 @@ class SolanaFetcher:
                     data = r.json()
                     raw = data.get("data", data) if isinstance(data, dict) and "data" in data else data
                     if raw and isinstance(raw, dict): return self._parse_solscan_tx(raw, tx_hash)
-            except Exception as e: print(f"[Solscan TX] {e}")
+            except: pass
         return None
 
     def _parse_solscan_tx(self, tx: dict, sig: str = "") -> dict:
-        sig   = sig or tx.get("txHash") or tx.get("signature") or tx.get("tx") or ""
-        ts    = tx.get("blockTime") or tx.get("block_time") or 0
+        sig  = sig or tx.get("txHash") or tx.get("signature") or ""
+        ts   = tx.get("blockTime") or tx.get("block_time") or 0
         tts, nts = [], []
         for t in tx.get("tokenTransfers", []):
             src = t.get("sourceOwner") or t.get("source") or ""
@@ -247,8 +268,8 @@ class SolanaFetcher:
             if f: dex_name = dn; dex_pid = addr; break
         tts, nts = [], []
         from collections import defaultdict
-        ptb = {b["accountIndex"]: b for b in (meta.get("preTokenBalances") or [])}
-        pptb= {b["accountIndex"]: b for b in (meta.get("postTokenBalances") or [])}
+        ptb  = {b["accountIndex"]: b for b in (meta.get("preTokenBalances")  or [])}
+        pptb = {b["accountIndex"]: b for b in (meta.get("postTokenBalances") or [])}
         mo: dict = defaultdict(list); mi: dict = defaultdict(list)
         for idx in set(ptb) | set(pptb):
             pre = ptb.get(idx, {}); post = pptb.get(idx, {})
@@ -298,18 +319,12 @@ class SolanaFetcher:
         }
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Rastreamento — segue até os fundos pararem
+    # Rastreamento principal
     # ─────────────────────────────────────────────────────────────────────────
 
     async def trace_token_flow(self, wallet: str, token: str, amount: float,
                                transactions: list[dict], max_hops: int = 20,
                                tx_hash: Optional[str] = None) -> dict:
-        """
-        Rastreia fundos até pararem de se mover.
-        Para em: CEX, Bridge, DEX (depois continua com token de saída),
-                 carteira PARKED (sem saídas), ou limites de segurança.
-        Detecta: splits (1→N), fundos estacionados, padrões de lavagem.
-        """
         graph = {
             "nodes": [{"id": wallet, "label": "Carteira Hackeada (Vítima)", "type": "VICTIM",
                        "is_cex": False, "is_dex": False, "is_bridge": False,
@@ -319,28 +334,24 @@ class SolanaFetcher:
         }
 
         token_lower = token.lower().strip()
-        # visited: "wallet:mint" — permite re-visitar com token diferente pós-swap
         visited: set[str] = {f"{wallet}:{token_lower}"}
 
         # ── HOP 0→1 ──────────────────────────────────────────────────────────
         if tx_hash:
-            print(f"[Fetcher] TX Hash: {tx_hash}")
+            print(f"[Fetcher] TX Hash: {tx_hash[:30]}...")
             tx_transfers = await self._transfers_from_tx_hash(wallet, token_lower, tx_hash)
-            if not tx_transfers:
-                print(f"[Fetcher] ERRO: TX não encontrada.")
-                outgoing = []
-            elif len(tx_transfers) == 1:
-                outgoing = tx_transfers
-            else:
-                outgoing = self._pick_best_from_list(tx_transfers, amount)
+            outgoing = [] if not tx_transfers else (
+                tx_transfers if len(tx_transfers) == 1
+                else self._pick_best_from_list(tx_transfers, amount)
+            )
         else:
             outgoing = self._best_match_transfers(wallet, token_lower, transactions, amount)
 
         actual_mint = next(
-            (t["mint"].lower() for t in outgoing if t.get("mint") and t["mint"].lower() != "sol"),
+            (t["mint"].lower() for t in outgoing if t.get("mint") and t["mint"].lower() not in SOL_SYMBOLS),
             token_lower,
         )
-        print(f"[Fetcher] Mint inicial: {actual_mint}")
+        print(f"[Fetcher] Mint inicial: {_mint_display_name(actual_mint)}")
 
         # BFS: (wallet, received_amount, received_ts, depth, current_mint)
         bfs_queue: list[tuple[str, object, int, int, str]] = []
@@ -357,76 +368,58 @@ class SolanaFetcher:
                 visited.add(vkey)
                 bfs_queue.append((dest, tx.get("amount"), tx.get("timestamp") or 0, 1, actual_mint))
 
-        # ── BFS principal ─────────────────────────────────────────────────────
+        # ── BFS ───────────────────────────────────────────────────────────────
         total_processed = 0
         while bfs_queue:
             hop_wallet, recv_amount, recv_ts, depth, current_mint = bfs_queue.pop(0)
 
-            # Limites de segurança
             if total_processed >= MAX_BFS_WALLETS:
-                print(f"[Fetcher] Limite de segurança: {MAX_BFS_WALLETS} carteiras processadas.")
                 self._mark_node_truncated(graph, hop_wallet)
                 continue
             if depth >= MAX_BFS_DEPTH:
-                print(f"[Fetcher] Profundidade máxima atingida: {hop_wallet[:20]}...")
                 continue
 
             total_processed += 1
-            print(f"[Fetcher] BFS {depth}→{depth+1} [{total_processed}/{MAX_BFS_WALLETS}]: {hop_wallet[:20]}... (mint={current_mint[:15]}...)")
+            mint_disp = _mint_display_name(current_mint)
+            print(f"[Fetcher] BFS [{total_processed}] depth={depth}: {hop_wallet[:20]}... mint={mint_disp}")
 
-            hop_txs = await self.get_wallet_transactions(hop_wallet, limit=30)
+            hop_txs = await self.get_wallet_transactions(hop_wallet, limit=50)
             hop_out = self._extract_outgoing_transfers(
                 hop_wallet, current_mint, hop_txs,
                 min_timestamp=recv_ts, received_amount=recv_amount,
             )
 
-            # ── CARTEIRA PARKED: recebeu mas não moveu ────────────────────────
+            # ── PARKED: recebeu mas não moveu ─────────────────────────────────
             if not hop_out:
-                self._mark_parked(graph, hop_wallet, recv_ts)
+                self._mark_parked(graph, hop_wallet, recv_ts, current_mint)
                 if hop_wallet not in graph["parked_wallets"]:
                     graph["parked_wallets"].append(hop_wallet)
-                print(f"[Fetcher] 🅿️ PARKED: {hop_wallet[:20]}... (sem saídas após receber)")
+                print(f"[Fetcher] 🅿️ PARKED: {hop_wallet[:20]}... (sem saídas de {mint_disp})")
                 continue
 
-            # ── SPLIT: 1 carteira → N destinos ──────────────────────────────
-            if len(hop_out) > 1:
-                split_count = len([t for t in hop_out if t.get("transfer_type") != "DEX_SWAP"])
-                if split_count > 1:
-                    self._mark_split(graph, hop_wallet, split_count)
-                    print(f"[Fetcher] ⚡ SPLIT: {hop_wallet[:20]}... → {split_count} destinos")
+            # ── SPLIT: 1→N ───────────────────────────────────────────────────
+            non_dex = [t for t in hop_out if t.get("transfer_type") != "DEX_SWAP"]
+            if len(non_dex) > 1:
+                self._mark_split(graph, hop_wallet, len(non_dex))
+                print(f"[Fetcher] ⚡ SPLIT: {hop_wallet[:20]}... → {len(non_dex)} destinos")
 
-            # ── Processa saídas (até MAX_OUTGOING_NODE) ──────────────────────
+            # ── Processa saídas ───────────────────────────────────────────────
             for tx in hop_out[:MAX_OUTGOING_NODE]:
-                dest   = tx.get("to")
                 t_type = tx.get("transfer_type", "TRANSFER")
 
-                # DEX SWAP
                 if t_type == "DEX_SWAP":
-                    dex_name = tx.get("dex_name", "DEX Swap")
-                    node_id  = tx.get("dex_pid") or dex_name
-                    dex_cls  = {
-                        "is_cex": False, "is_dex": True, "is_bridge": False,
-                        "is_defi": False, "is_parked": False,
-                        "label": dex_name, "node_type": "DEX_SWAP", "risk": "LOW RISK",
-                    }
-                    self._update_node(graph, node_id, dex_cls, depth + 1)
-                    self._add_edge(graph, hop_wallet, node_id, tx)
-                    if dex_name not in graph["dex_detected"]:
-                        graph["dex_detected"].append(dex_name)
-                    print(f"[Fetcher] 🔄 SWAP: {hop_wallet[:20]}... → {dex_name}")
-
-                    # Continua com token de saída
-                    output_mint, output_amount = tx.get("output_mint"), tx.get("output_amount")
-                    if output_mint:
-                        out_mint_lower = output_mint.lower()
-                        vkey = f"{hop_wallet}:{out_mint_lower}"
-                        if vkey not in visited and depth + 1 < MAX_BFS_DEPTH:
-                            visited.add(vkey)
-                            print(f"[Fetcher] 🔄 Pós-swap: {hop_wallet[:20]}... → {out_mint_lower[:20]}...")
-                            bfs_queue.insert(0, (hop_wallet, output_amount, tx.get("timestamp") or 0, depth + 1, out_mint_lower))
+                    await self._handle_dex_swap(
+                        graph, visited, bfs_queue,
+                        hop_wallet=hop_wallet,
+                        swap_tx=tx,
+                        depth=depth,
+                        recv_ts=recv_ts,
+                        current_mint=current_mint,
+                        total_processed=total_processed,
+                    )
                     continue
 
-                # Transfer normal
+                dest = tx.get("to")
                 if not dest: continue
                 vkey = f"{dest}:{current_mint}"
                 if vkey in visited: continue
@@ -458,23 +451,125 @@ class SolanaFetcher:
             "truncated":          total_processed >= MAX_BFS_WALLETS,
         }
 
-        print(f"[Fetcher] Rastreamento concluído: {len(graph['nodes'])} nós | "
+        print(f"[Fetcher] ✅ Concluído: {len(graph['nodes'])} nós | "
               f"{len(parked_nodes)} parked | {len(split_nodes)} splits | "
-              f"CEX={graph['cex_detected']} DEX={graph['dex_detected']}")
-
+              f"cex={graph['cex_detected']} | dex={graph['dex_detected']}")
         return graph
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Node state helpers
+    # DEX Swap Handler — processamento imediato pós-swap
     # ─────────────────────────────────────────────────────────────────────────
 
-    def _mark_parked(self, graph: dict, wallet: str, recv_ts: int):
+    async def _handle_dex_swap(self, graph: dict, visited: set, bfs_queue: list,
+                                hop_wallet: str, swap_tx: dict, depth: int,
+                                recv_ts: int, current_mint: str, total_processed: int):
+        """
+        Processa um swap DEX:
+        1. Adiciona nó DEX ao grafo
+        2. Detecta token de saída
+        3. IMEDIATAMENTE busca e processa saídas do token de saída
+           sem re-enfileirar (evita problemas de timing/visited)
+        """
+        dex_name = swap_tx.get("dex_name", "DEX Swap")
+        dex_pid  = swap_tx.get("dex_pid", "")
+        node_id  = dex_pid or dex_name
+        swap_ts  = swap_tx.get("timestamp") or recv_ts
+
+        # Adiciona nó DEX
+        self._update_node(graph, node_id, {
+            "is_cex": False, "is_dex": True, "is_bridge": False,
+            "is_defi": False, "label": dex_name, "node_type": "DEX_SWAP", "risk": "LOW RISK",
+        }, depth + 1)
+        self._add_edge(graph, hop_wallet, node_id, swap_tx)
+        if dex_name not in graph["dex_detected"]:
+            graph["dex_detected"].append(dex_name)
+
+        # Detecta token de saída
+        output_mint, output_amount = swap_tx.get("output_mint"), swap_tx.get("output_amount")
+        if not output_mint:
+            print(f"[Fetcher] ⚠️ Token saída desconhecido para swap em {dex_name}")
+            return
+
+        out_mint_lower = output_mint.lower()
+        mint_disp = _mint_display_name(out_mint_lower)
+        print(f"[Fetcher] 🔄 SWAP {dex_name}: {_mint_display_name(current_mint)} → {mint_disp}")
+
+        # Verifica se já processamos este wallet com este token
+        vkey_swap = f"{hop_wallet}:{out_mint_lower}"
+        if vkey_swap in visited:
+            print(f"[Fetcher] 🔄 Pós-swap já processado: {hop_wallet[:20]}... {mint_disp}")
+            return
+
+        visited.add(vkey_swap)
+
+        # IMEDIATAMENTE busca saídas do token de saída desta carteira
+        # Usa limit=50 para capturar atividade pós-swap
+        print(f"[Fetcher] 🔍 Buscando saídas de {mint_disp} em {hop_wallet[:20]}...")
+        post_txs = await self.get_wallet_transactions(hop_wallet, limit=50)
+        post_out = self._extract_outgoing_transfers(
+            hop_wallet, out_mint_lower, post_txs,
+            min_timestamp=swap_ts,
+            received_amount=None,  # sem filtro de proporção pós-swap
+        )
+
+        if not post_out:
+            # Carteira recebeu o token mas não enviou → PARKED com o novo token
+            self._mark_parked(graph, hop_wallet, swap_ts, out_mint_lower)
+            if hop_wallet not in graph["parked_wallets"]:
+                graph["parked_wallets"].append(hop_wallet)
+            print(f"[Fetcher] 🅿️ PARKED pós-swap: {hop_wallet[:20]}... ({mint_disp} sem movimento)")
+            return
+
+        # Processa saídas do token de saída
+        if len(post_out) > 1:
+            self._mark_split(graph, hop_wallet, len(post_out))
+            print(f"[Fetcher] ⚡ SPLIT pós-swap: {hop_wallet[:20]}... → {len(post_out)} destinos de {mint_disp}")
+
+        for po in post_out[:MAX_OUTGOING_NODE]:
+            pt_type = po.get("transfer_type", "TRANSFER")
+
+            # Swap encadeado (swap → swap)
+            if pt_type == "DEX_SWAP":
+                print(f"[Fetcher] 🔄 Swap encadeado detectado!")
+                if total_processed < MAX_BFS_WALLETS and depth + 2 < MAX_BFS_DEPTH:
+                    await self._handle_dex_swap(
+                        graph, visited, bfs_queue,
+                        hop_wallet=hop_wallet, swap_tx=po,
+                        depth=depth + 1, recv_ts=swap_ts,
+                        current_mint=out_mint_lower,
+                        total_processed=total_processed,
+                    )
+                continue
+
+            dest = po.get("to")
+            if not dest: continue
+            vkey = f"{dest}:{out_mint_lower}"
+            if vkey in visited: continue
+
+            cls = await self._classify_and_enrich(dest)
+            self._update_node(graph, dest, cls, depth + 2)
+            self._add_edge(graph, hop_wallet, dest, po)
+            self._update_detections(graph, cls)
+
+            print(f"[Fetcher] ✅ Pós-swap: {hop_wallet[:20]}... → {dest[:20]}... ({cls['node_type']} | {mint_disp})")
+
+            if not self._is_terminal(cls):
+                visited.add(vkey)
+                bfs_queue.append((dest, po.get("amount"), po.get("timestamp") or 0, depth + 2, out_mint_lower))
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Node helpers
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _mark_parked(self, graph: dict, wallet: str, recv_ts: int, token: str = ""):
         for n in graph["nodes"]:
             if n["id"] == wallet:
+                token_disp = _mint_display_name(token) if token else ""
                 n["type"]      = "PARKED"
                 n["is_parked"] = True
-                n["label"]     = f"Carteira Estacionada"
+                n["label"]     = f"Carteira Estacionada{f' ({token_disp})' if token_disp else ''}"
                 n["recv_ts"]   = recv_ts
+                n["parked_token"] = token
                 break
 
     def _mark_split(self, graph: dict, wallet: str, split_count: int):
@@ -482,7 +577,7 @@ class SolanaFetcher:
             if n["id"] == wallet:
                 n["is_split"]    = True
                 n["split_count"] = split_count
-                if n.get("type") == "WALLET":
+                if n.get("type") not in ("PARKED", "CEX", "BRIDGE", "DEX_SWAP"):
                     n["type"]  = "SPLIT"
                     n["label"] = f"Carteira Split ({split_count} destinos)"
                 break
@@ -490,13 +585,7 @@ class SolanaFetcher:
     def _mark_node_truncated(self, graph: dict, wallet: str):
         for n in graph["nodes"]:
             if n["id"] == wallet:
-                n["truncated"] = True
-                n["label"]    += " [rastreamento interrompido]"
-                break
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Classification helpers
-    # ─────────────────────────────────────────────────────────────────────────
+                n["truncated"] = True; break
 
     async def _classify_and_enrich(self, dest: str) -> dict:
         cls = _classify_dest(dest)
@@ -513,9 +602,9 @@ class SolanaFetcher:
     def _update_node(self, graph: dict, node_id: str, cls: dict, depth: int):
         if node_id not in [n["id"] for n in graph["nodes"]]:
             graph["nodes"].append({
-                "id": node_id, "label": cls["label"], "type": cls["node_type"],
-                "is_cex": cls["is_cex"], "is_dex": cls["is_dex"],
-                "is_bridge": cls["is_bridge"], "is_defi": cls["is_defi"],
+                "id": node_id, "label": cls.get("label", "?"), "type": cls.get("node_type", "WALLET"),
+                "is_cex": cls.get("is_cex", False), "is_dex": cls.get("is_dex", False),
+                "is_bridge": cls.get("is_bridge", False), "is_defi": cls.get("is_defi", False),
                 "is_parked": False, "is_split": False, "depth": depth,
             })
 
@@ -530,13 +619,14 @@ class SolanaFetcher:
             "dex_name": tx.get("dex_name"),
             "output_mint": tx.get("output_mint"),
             "output_amount": tx.get("output_amount"),
+            "output_mint_name": _mint_display_name(tx.get("output_mint") or "") if tx.get("output_mint") else None,
         })
 
     def _update_detections(self, graph: dict, cls: dict):
-        lbl = cls["label"]
-        if cls["is_cex"]    and lbl not in graph["cex_detected"]:    graph["cex_detected"].append(lbl)
-        if cls["is_bridge"] and lbl not in graph["bridge_detected"]: graph["bridge_detected"].append(lbl)
-        if cls["is_dex"]    and lbl not in graph["dex_detected"]:    graph["dex_detected"].append(lbl)
+        lbl = cls.get("label", "")
+        if cls.get("is_cex")    and lbl not in graph["cex_detected"]:    graph["cex_detected"].append(lbl)
+        if cls.get("is_bridge") and lbl not in graph["bridge_detected"]: graph["bridge_detected"].append(lbl)
+        if cls.get("is_dex")    and lbl not in graph["dex_detected"]:    graph["dex_detected"].append(lbl)
 
     # ─────────────────────────────────────────────────────────────────────────
     # Helius entity label
@@ -597,8 +687,7 @@ class SolanaFetcher:
         tx = await self._fetch_tx_data(tx_hash)
         if not tx: return []
         is_sol = token_lower in SOL_SYMBOLS
-        ts = tx.get("timestamp", 0)
-        wl = wallet.lower()
+        ts = tx.get("timestamp", 0); wl = wallet.lower()
         strict: list[dict] = []
         if not is_sol:
             for t in tx.get("tokenTransfers", []):
