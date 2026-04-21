@@ -13,7 +13,9 @@ from datetime import datetime
 
 from cex_database import (
     CEX_ADDRESSES, BRIDGE_PROGRAMS, DEFI_PROGRAMS, CEX_NAME_PATTERNS,
-    is_cex_address, detect_cex_from_label, get_entity_info
+    ALL_DEX_PROGRAMS, ALL_KNOWN_PROGRAMS,
+    is_cex_address, is_dex_program, is_bridge_program,
+    detect_cex_from_label, get_entity_info, classify_address,
 )
 
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "")
@@ -27,6 +29,41 @@ SOLANA_RPC_URL = "https://api.mainnet-beta.solana.com"
 
 SOL_MINT = "So11111111111111111111111111111111111111112"
 SOL_SYMBOLS = {"sol", "solana", SOL_MINT.lower()}
+
+
+def _classify_dest(address: str) -> dict:
+    """
+    Classifica um endereço destino em CEX, DEX, Bridge, DeFi ou Wallet.
+    Retorna dict com: is_cex, is_dex, is_bridge, is_defi, label, node_type, risk
+    """
+    info = classify_address(address)
+    is_cex  = info["is_cex"]
+    is_dex  = info["is_dex"]
+    is_brdg = info["is_bridge"]
+    is_defi = info["is_defi"]
+
+    if is_cex:
+        node_type = "CEX"
+    elif is_brdg:
+        node_type = "BRIDGE"
+    elif is_dex:
+        node_type = "DEX_SWAP"
+    elif is_defi:
+        node_type = "DEFI"
+    else:
+        node_type = "WALLET"
+
+    label = info.get("name") or "Wallet Destino"
+
+    return {
+        "is_cex":    is_cex,
+        "is_dex":    is_dex,
+        "is_bridge": is_brdg,
+        "is_defi":   is_defi,
+        "label":     label,
+        "node_type": node_type,
+        "risk":      info.get("risk", "UNKNOWN"),
+    }
 
 
 class SolanaFetcher:
@@ -46,8 +83,6 @@ class SolanaFetcher:
     # -------------------------------------------------------------------------
 
     async def get_wallet_transactions(self, wallet: str, limit: int = 50) -> list[dict]:
-        """Busca transações com parsing enriquecido.
-        Tenta Helius primeiro, depois Solscan, depois RPC público."""
         if self.use_helius:
             txs = await self._helius_get_transactions(wallet, limit)
             if txs:
@@ -80,7 +115,6 @@ class SolanaFetcher:
     # -------------------------------------------------------------------------
 
     async def _solscan_get_wallet_transactions(self, wallet: str, limit: int) -> list[dict]:
-        """Busca transações da carteira via Solscan (Pro ou Public API)."""
         if self.use_solscan_pro:
             url = f"{SOLSCAN_PRO_URL}/account/transactions"
             params = {"address": wallet, "page": 1, "page_size": min(limit, 100)}
@@ -93,7 +127,6 @@ class SolanaFetcher:
                 resp = await client.get(url, params=params, headers=self._solscan_headers())
                 if resp.status_code == 200:
                     data = resp.json()
-                    # Pro API envolve em {"success": true, "data": [...]}
                     items = data.get("data", data) if isinstance(data, dict) else data
                     if isinstance(items, list):
                         return [self._parse_solscan_tx(tx) for tx in items if tx]
@@ -103,7 +136,6 @@ class SolanaFetcher:
         return []
 
     async def _solscan_get_transaction(self, tx_hash: str) -> Optional[dict]:
-        """Busca uma transação específica pelo hash via Solscan."""
         if self.use_solscan_pro:
             url = f"{SOLSCAN_PRO_URL}/transaction/detail"
             params = {"tx": tx_hash}
@@ -125,14 +157,11 @@ class SolanaFetcher:
         return None
 
     def _parse_solscan_tx(self, tx: dict, override_sig: str = "") -> dict:
-        """Converte resposta do Solscan para o formato interno (igual ao Helius)."""
         sig = override_sig or tx.get("txHash") or tx.get("signature") or tx.get("tx") or ""
         ts = tx.get("blockTime") or tx.get("block_time") or 0
         token_transfers = []
         native_transfers = []
 
-        # Solscan tokenTransfers: [{source/sourceOwner, destination/destinationOwner, token, amount}]
-        # Prefer *Owner fields (wallet address) over plain fields (ATA address)
         for t in tx.get("tokenTransfers", []):
             source = t.get("sourceOwner") or t.get("source") or ""
             dest = t.get("destinationOwner") or t.get("destination") or ""
@@ -152,7 +181,6 @@ class SolanaFetcher:
                     "tokenAmount": ui_amt,
                 })
 
-        # Solscan solTransfers: [{source, destination, amount (lamports)}]
         for s in tx.get("solTransfers", []):
             source = s.get("source") or ""
             dest = s.get("destination") or ""
@@ -183,12 +211,11 @@ class SolanaFetcher:
     # -------------------------------------------------------------------------
 
     async def _rpc_get_transactions(self, wallet: str, limit: int) -> list[dict]:
-        """Fallback: busca via RPC público da Solana (dados mais brutos)."""
         signatures = await self._rpc_get_signatures(wallet, limit)
         transactions = []
 
         async with httpx.AsyncClient(timeout=30) as client:
-            for sig_info in signatures[:20]:  # Limita para não sobrecarregar
+            for sig_info in signatures[:20]:
                 sig = sig_info.get("signature")
                 if not sig:
                     continue
@@ -226,7 +253,6 @@ class SolanaFetcher:
         return []
 
     def _parse_rpc_transaction(self, tx_data: dict, signature: str) -> dict:
-        """Converte tx RPC bruta para formato parecido com Helius."""
         meta = tx_data.get("meta", {}) or {}
         message = tx_data.get("transaction", {}).get("message", {})
         block_time = tx_data.get("blockTime", 0)
@@ -234,18 +260,13 @@ class SolanaFetcher:
         token_transfers = []
         native_transfers = []
 
-        # Token balance changes
         pre_token_balances = {b["accountIndex"]: b for b in (meta.get("preTokenBalances") or [])}
         post_token_balances = {b["accountIndex"]: b for b in (meta.get("postTokenBalances") or [])}
         account_keys = [a.get("pubkey", "") for a in message.get("accountKeys", [])]
 
-        # Collect per-mint outgoing and incoming sides separately, then pair them.
-        # The raw RPC gives balance deltas per account — each account only knows its
-        # own side of the transfer. We must match sender ↔ receiver by mint+amount
-        # to produce Helius-style entries with both fromUserAccount and toUserAccount.
         from collections import defaultdict
-        mint_outgoing: dict = defaultdict(list)  # mint -> [{owner, amount}]
-        mint_incoming: dict = defaultdict(list)  # mint -> [{owner, amount}]
+        mint_outgoing: dict = defaultdict(list)
+        mint_incoming: dict = defaultdict(list)
 
         all_indices = set(pre_token_balances.keys()) | set(post_token_balances.keys())
         for idx in all_indices:
@@ -258,8 +279,6 @@ class SolanaFetcher:
             if abs(diff) < 1e-9:
                 continue
 
-            # `owner` is the actual wallet address; fall back to account key (ATA) only
-            # if owner is missing (some older RPC responses may omit it).
             owner = (
                 post.get("owner") or pre.get("owner")
                 or (account_keys[idx] if idx < len(account_keys) else "unknown")
@@ -271,7 +290,6 @@ class SolanaFetcher:
             else:
                 mint_incoming[mint].append({"owner": owner, "amount": abs(diff)})
 
-        # Pair each outgoing side with the best-matching incoming side (same mint).
         all_mints = set(mint_outgoing.keys()) | set(mint_incoming.keys())
         for mint in all_mints:
             outs = mint_outgoing.get(mint, [])
@@ -279,7 +297,6 @@ class SolanaFetcher:
             used_incoming: set = set()
 
             for out in outs:
-                # Find the incoming entry with the closest amount (fees may cause small diff)
                 best_idx = None
                 best_diff = float("inf")
                 for i, inc in enumerate(ins):
@@ -301,7 +318,6 @@ class SolanaFetcher:
                     "tokenAmount": out["amount"],
                 })
 
-            # Unmatched incoming (e.g., initial mint/airdrop with no sender)
             for i, inc in enumerate(ins):
                 if i in used_incoming:
                     continue
@@ -312,7 +328,6 @@ class SolanaFetcher:
                     "tokenAmount": inc["amount"],
                 })
 
-        # Native SOL changes — pair senders with receivers the same way.
         pre_balances = meta.get("preBalances", [])
         post_balances = meta.get("postBalances", [])
         sol_senders = []
@@ -371,72 +386,50 @@ class SolanaFetcher:
         max_hops: int = 2,
         tx_hash: Optional[str] = None,
     ) -> dict:
-        """
-        Constrói grafo de fluxo de fundos a partir da carteira vítima.
-
-        Args:
-            tx_hash: Hash da transação do roubo (opcional). Quando fornecido,
-                     o HOP 0->1 é construído a partir dessa TX específica, com
-                     precisão total. Sem ele, usa best-match por valor.
-        """
         graph = {
             "nodes": [{
                 "id": wallet,
                 "label": "Carteira Hackeada (Vítima)",
                 "type": "VICTIM",
                 "is_cex": False,
+                "is_dex": False,
                 "is_bridge": False,
+                "is_defi": False,
                 "depth": 0,
             }],
             "edges": [],
             "cex_detected": [],
             "bridge_detected": [],
+            "dex_detected": [],
             "summary": {},
         }
 
         token_lower = token.lower().strip()
         visited: set[str] = {wallet}
 
-        # HOP 0->1: determina as transferências de saída da carteira vítima.
+        # HOP 0->1
         if tx_hash:
-            # MODO TX HASH: a próxima carteira está DENTRO desta transação.
-            # Nunca buscar em outra TX — o usuário garantiu que este é o hash do roubo.
             print(f"[Fetcher] Modo TX Hash: buscando transação {tx_hash}")
             tx_transfers = await self._transfers_from_tx_hash(wallet, token_lower, tx_hash)
 
             if not tx_transfers:
-                # TX não encontrada na rede (inválida, pruned, ou erro de rede).
-                # Não fazemos fallback para o histórico — o resultado seria errado.
-                print(
-                    f"[Fetcher] ERRO: TX hash {tx_hash[:30]}... não encontrada ou sem transfers. "
-                    f"Verifique o hash e a conectividade com o RPC."
-                )
+                print(f"[Fetcher] ERRO: TX hash {tx_hash[:30]}... não encontrada ou sem transfers.")
                 outgoing = []
             elif len(tx_transfers) == 1:
                 outgoing = tx_transfers
                 print(f"[Fetcher] TX -> única saída: amount={tx_transfers[0].get('amount')} destino={tx_transfers[0].get('to', '')[:30]}...")
             else:
-                # Múltiplos transfers na TX — seleciona o mais próximo do amount informado.
                 outgoing = self._pick_best_from_list(tx_transfers, amount)
-                print(
-                    f"[Fetcher] TX com {len(tx_transfers)} transfers — "
-                    f"selecionado: amount={outgoing[0].get('amount')} destino={outgoing[0].get('to', '')[:30]}..."
-                )
+                print(f"[Fetcher] TX com {len(tx_transfers)} transfers — selecionado: amount={outgoing[0].get('amount')} destino={outgoing[0].get('to', '')[:30]}...")
         else:
-            # MODO HEURÍSTICO: sem hash, usa best-match por proximidade ao valor roubado.
             outgoing = self._best_match_transfers(wallet, token_lower, transactions, amount)
 
-        # Após HOP 0->1, captura o mint address real da transferência encontrada.
-        # Isso garante que o HOP 1->2 rastreie o mesmo token, mesmo que o usuário
-        # tenha informado apenas um símbolo (ex: "Anon") em vez do mint address.
         actual_mint = next(
             (tx["mint"].lower() for tx in outgoing if tx.get("mint") and tx["mint"].lower() != "sol"),
             token_lower,
         )
         print(f"[Fetcher] Mint real identificado no HOP 0->1: {actual_mint}")
 
-        # HOP 0->1: processa saídas da carteira vítima e monta o grafo inicial.
-        # BFS queue: (wallet_addr, received_amount, received_timestamp, depth)
         bfs_queue: list[tuple[str, object, int, int]] = []
 
         for tx in outgoing:
@@ -444,28 +437,30 @@ class SolanaFetcher:
             if not dest or dest == wallet:
                 continue
 
-            is_cex, cex_name = is_cex_address(dest)
-            is_bridge = dest in BRIDGE_PROGRAMS
+            classification = _classify_dest(dest)
 
-            # Detecção dinâmica via Helius para endereços não catalogados estaticamente
-            if not is_cex and not is_bridge and self.use_helius:
+            # Detecção dinâmica via Helius para endereços não catalogados
+            if not classification["is_cex"] and not classification["is_dex"] and not classification["is_bridge"] and self.use_helius:
                 helius_label = await self._helius_get_entity_label(dest)
                 if helius_label:
                     is_cex_dyn, cex_dyn_name = detect_cex_from_label(helius_label)
                     if is_cex_dyn:
-                        is_cex, cex_name = True, cex_dyn_name
+                        classification["is_cex"] = True
+                        classification["label"] = cex_dyn_name
+                        classification["node_type"] = "CEX"
                         print(f"[Helius] CEX detectada dinamicamente (HOP 0→1): {cex_dyn_name} | {dest[:20]}...")
 
-            node_label = cex_name or BRIDGE_PROGRAMS.get(dest) or DEFI_PROGRAMS.get(dest) or "Wallet Destino"
-            node_type = "CEX" if is_cex else ("BRIDGE" if is_bridge else "WALLET")
+            print(f"[Fetcher] HOP 0→1 dest={dest[:20]}... tipo={classification['node_type']} label={classification['label']}")
 
             if dest not in [n["id"] for n in graph["nodes"]]:
                 graph["nodes"].append({
                     "id": dest,
-                    "label": node_label,
-                    "type": node_type,
-                    "is_cex": is_cex,
-                    "is_bridge": is_bridge,
+                    "label": classification["label"],
+                    "type": classification["node_type"],
+                    "is_cex":    classification["is_cex"],
+                    "is_dex":    classification["is_dex"],
+                    "is_bridge": classification["is_bridge"],
+                    "is_defi":   classification["is_defi"],
                     "depth": 1,
                 })
 
@@ -479,22 +474,20 @@ class SolanaFetcher:
                 "signature": tx.get("signature"),
             })
 
-            if is_cex and cex_name not in graph["cex_detected"]:
-                graph["cex_detected"].append(cex_name)
-            if is_bridge and node_label not in graph["bridge_detected"]:
-                graph["bridge_detected"].append(node_label)
+            if classification["is_cex"] and classification["label"] not in graph["cex_detected"]:
+                graph["cex_detected"].append(classification["label"])
+            if classification["is_bridge"] and classification["label"] not in graph["bridge_detected"]:
+                graph["bridge_detected"].append(classification["label"])
+            if classification["is_dex"] and classification["label"] not in graph["dex_detected"]:
+                graph["dex_detected"].append(classification["label"])
 
-            # Adiciona à fila BFS apenas carteiras intermediárias (não CEX, não bridge)
-            if not is_cex and not is_bridge and dest not in visited:
-                bfs_queue.append((
-                    dest,
-                    tx.get("amount"),
-                    tx.get("timestamp") or 0,
-                    1,
-                ))
+            # Para BFS: só continua em carteiras regulares
+            # CEX, Bridge e DEX são destinos finais — não rastreamos endereços internos de pool
+            is_terminal = classification["is_cex"] or classification["is_bridge"] or classification["is_dex"] or classification["is_defi"]
+            if not is_terminal and dest not in visited:
+                bfs_queue.append((dest, tx.get("amount"), tx.get("timestamp") or 0, 1))
 
-        # BFS: rastreia hops intermediários até max_hops de profundidade.
-        # Para em cada caminho ao detectar CEX ou bridge.
+        # BFS para hops intermediários
         while bfs_queue:
             hop_wallet, received_amount, received_timestamp, current_depth = bfs_queue.pop(0)
 
@@ -521,28 +514,30 @@ class SolanaFetcher:
                 if not dest or dest in visited:
                     continue
 
-                is_cex, cex_name = is_cex_address(dest)
-                is_bridge = dest in BRIDGE_PROGRAMS
+                classification = _classify_dest(dest)
 
-                # Detecção dinâmica via Helius para endereços não catalogados estaticamente
-                if not is_cex and not is_bridge and self.use_helius:
+                # Detecção dinâmica via Helius
+                if not classification["is_cex"] and not classification["is_dex"] and not classification["is_bridge"] and self.use_helius:
                     helius_label = await self._helius_get_entity_label(dest)
                     if helius_label:
                         is_cex_dyn, cex_dyn_name = detect_cex_from_label(helius_label)
                         if is_cex_dyn:
-                            is_cex, cex_name = True, cex_dyn_name
+                            classification["is_cex"] = True
+                            classification["label"] = cex_dyn_name
+                            classification["node_type"] = "CEX"
                             print(f"[Helius] CEX detectada dinamicamente (HOP {current_depth}→{current_depth+1}): {cex_dyn_name} | {dest[:20]}...")
 
-                node_label = cex_name or BRIDGE_PROGRAMS.get(dest) or DEFI_PROGRAMS.get(dest) or f"Wallet Intermediária"
-                node_type = "CEX" if is_cex else ("BRIDGE" if is_bridge else "WALLET")
+                print(f"[Fetcher] HOP {current_depth}→{current_depth+1} dest={dest[:20]}... tipo={classification['node_type']} label={classification['label']}")
 
                 if dest not in [n["id"] for n in graph["nodes"]]:
                     graph["nodes"].append({
                         "id": dest,
-                        "label": node_label,
-                        "type": node_type,
-                        "is_cex": is_cex,
-                        "is_bridge": is_bridge,
+                        "label": classification["label"],
+                        "type": classification["node_type"],
+                        "is_cex":    classification["is_cex"],
+                        "is_dex":    classification["is_dex"],
+                        "is_bridge": classification["is_bridge"],
+                        "is_defi":   classification["is_defi"],
                         "depth": current_depth + 1,
                     })
 
@@ -556,22 +551,18 @@ class SolanaFetcher:
                     "signature": tx.get("signature"),
                 })
 
-                if is_cex and cex_name not in graph["cex_detected"]:
-                    graph["cex_detected"].append(cex_name)
-                if is_bridge and node_label not in graph["bridge_detected"]:
-                    graph["bridge_detected"].append(node_label)
+                if classification["is_cex"] and classification["label"] not in graph["cex_detected"]:
+                    graph["cex_detected"].append(classification["label"])
+                if classification["is_bridge"] and classification["label"] not in graph["bridge_detected"]:
+                    graph["bridge_detected"].append(classification["label"])
+                if classification["is_dex"] and classification["label"] not in graph["dex_detected"]:
+                    graph["dex_detected"].append(classification["label"])
 
-                # Encerra este caminho ao detectar CEX ou bridge — não há razão para continuar
-                if is_cex or is_bridge:
+                is_terminal = classification["is_cex"] or classification["is_bridge"] or classification["is_dex"] or classification["is_defi"]
+                if is_terminal:
                     continue
 
-                # Continua rastreando esta carteira no próximo nível do BFS
-                bfs_queue.append((
-                    dest,
-                    tx.get("amount"),
-                    tx.get("timestamp") or 0,
-                    current_depth + 1,
-                ))
+                bfs_queue.append((dest, tx.get("amount"), tx.get("timestamp") or 0, current_depth + 1))
 
         graph["summary"] = {
             "total_nodes": len(graph["nodes"]),
@@ -579,23 +570,13 @@ class SolanaFetcher:
             "max_depth": max((n["depth"] for n in graph["nodes"]), default=0),
             "cex_found": len(graph["cex_detected"]) > 0,
             "bridge_used": len(graph["bridge_detected"]) > 0,
+            "dex_used": len(graph["dex_detected"]) > 0,
             "outgoing_transfers": len(outgoing),
         }
 
         return graph
 
     async def _helius_get_entity_label(self, address: str) -> str:
-        """
-        Consulta o Helius para identificar dinamicamente o label/entidade de um endereço.
-
-        Estratégia em camadas:
-          1. Verifica o campo `source` das transações mais recentes (ex: "BINANCE", "COINBASE")
-          2. Analisa o campo `description` por menções textuais de CEX conhecidas
-          3. Inspeciona `accountData[].label` no formato Enhanced Transaction do Helius
-
-        Retorna o label detectado (ex: "Binance") ou "" se desconhecido.
-        Chamado apenas para endereços não presentes na base estática para minimizar API calls.
-        """
         if not self.use_helius:
             return ""
 
@@ -613,22 +594,18 @@ class SolanaFetcher:
                     return ""
 
                 for tx in txs:
-                    # Camada 1: source field (Helius mapeia protocolos conhecidos)
                     source = (tx.get("source") or "").strip()
                     if source and source not in ("SYSTEM_PROGRAM", "UNKNOWN", ""):
-                        # source pode ser "BINANCE", "COINBASE", "JUPITER", etc.
                         is_cex_src, cex_name_src = detect_cex_from_label(source)
                         if is_cex_src:
                             return cex_name_src
 
-                    # Camada 2: description textual
                     desc = (tx.get("description") or "").lower()
                     if desc:
                         for pattern, name in CEX_NAME_PATTERNS.items():
                             if pattern in desc:
                                 return name
 
-                    # Camada 3: accountData[].label (formato Enhanced Transaction Helius)
                     address_lower = address.lower()
                     for acct_data in (tx.get("accountData") or []):
                         if (acct_data.get("account") or "").lower() == address_lower:
@@ -643,12 +620,6 @@ class SolanaFetcher:
                 return ""
 
     async def _fetch_tx_data(self, tx_hash: str) -> Optional[dict]:
-        """
-        Busca os dados de uma transação pelo hash.
-        Prioridade: Helius -> Solscan -> RPC público.
-        Retorna o objeto de transação parseado, ou None se não encontrado em nenhuma fonte.
-        """
-        # ── 1. Helius (mais rico) ─────────────────────────────────────────────
         if self.use_helius:
             url = f"{HELIUS_BASE_URL}/transactions"
             params = {"api-key": self.helius_key}
@@ -665,14 +636,12 @@ class SolanaFetcher:
                 except Exception as e:
                     print(f"[Helius TX] Erro: {e} — tentando Solscan...")
 
-        # ── 2. Solscan (dados parseados, sem necessidade de key) ──────────────
         tx_data = await self._solscan_get_transaction(tx_hash)
         if tx_data:
             print(f"[Fetcher] TX {tx_hash[:20]}... obtida via Solscan")
             return tx_data
         print(f"[Solscan TX] Não encontrada — tentando RPC público...")
 
-        # ── 3. RPC público (dados brutos) ─────────────────────────────────────
         payload_rpc = {
             "jsonrpc": "2.0", "id": 1,
             "method": "getTransaction",
@@ -698,16 +667,6 @@ class SolanaFetcher:
         token_lower: str,
         tx_hash: str,
     ) -> list[dict]:
-        """
-        Busca uma transação específica pelo hash e extrai as transferências
-        de saída relevantes.
-
-        Estratégia em dois passos:
-          1. Tenta encontrar transfers onde `fromUserAccount == wallet` (match exato).
-          2. Se não encontrar nada (wallet pode aparecer como ATA ou fee payer),
-             retorna TODOS os transfers de saída com `toUserAccount` preenchido —
-             o chamador escolhe pelo amount. NUNCA busca em outra transação.
-        """
         tx_data = await self._fetch_tx_data(tx_hash)
         if not tx_data:
             print(f"[Fetcher] TX {tx_hash[:30]}... não encontrada na rede.")
@@ -715,8 +674,6 @@ class SolanaFetcher:
 
         is_sol = token_lower in SOL_SYMBOLS
         ts = tx_data.get("timestamp", 0)
-
-        # ── Passo 1: match exato — wallet é o remetente direto ────────────────
         wallet_lower = wallet.lower()
         strict: list[dict] = []
 
@@ -754,11 +711,6 @@ class SolanaFetcher:
             print(f"[Fetcher] TX {tx_hash[:20]}... -> {len(strict)} saída(s) do wallet vítima (match exato)")
             return strict
 
-        # ── Passo 2: match amplo — coleta TODOS os transfers com destino ──────
-        # O wallet pode não aparecer como fromUserAccount (ex: assina via programa,
-        # usa ATA de outro owner, ou é o fee payer de uma instrução interna).
-        # Como o usuário garantiu que ESTA TX é a do roubo, qualquer transfer com
-        # destino preenchido é candidato — o chamador seleciona pelo amount.
         broad: list[dict] = []
 
         if not is_sol:
@@ -791,24 +743,13 @@ class SolanaFetcher:
                     })
 
         if broad:
-            print(
-                f"[Fetcher] TX {tx_hash[:20]}... -> wallet não aparece como remetente direto. "
-                f"Retornando {len(broad)} transfer(s) da TX para seleção por amount."
-            )
+            print(f"[Fetcher] TX {tx_hash[:20]}... -> wallet não aparece como remetente direto. Retornando {len(broad)} transfer(s) para seleção por amount.")
         else:
             print(f"[Fetcher] TX {tx_hash[:20]}... -> nenhum transfer encontrado na transação.")
 
         return broad
 
-    def _pick_best_from_list(
-        self,
-        transfers: list[dict],
-        target_amount: float,
-    ) -> list[dict]:
-        """
-        Dado uma lista de transfers já coletados, retorna o(s) mais próximo(s)
-        do target_amount. Usado quando uma única TX contém múltiplas saídas.
-        """
+    def _pick_best_from_list(self, transfers: list[dict], target_amount: float) -> list[dict]:
         def pct_diff(t: dict) -> float:
             try:
                 return abs(float(t.get("amount") or 0) - target_amount) / target_amount
@@ -818,26 +759,12 @@ class SolanaFetcher:
         ranked = sorted(transfers, key=pct_diff)
 
         for t in ranked:
-            print(
-                f"[Fetcher]   candidato: {t.get('amount')} -> {t.get('to','')[:20]}... "
-                f"({pct_diff(t)*100:.1f}% diff do alvo {target_amount})"
-            )
+            print(f"[Fetcher]   candidato: {t.get('amount')} -> {t.get('to','')[:20]}... ({pct_diff(t)*100:.1f}% diff do alvo {target_amount})")
 
-        # Retorna os que estão dentro de ±30%, senão só o mais próximo
         tight = [t for t in ranked if pct_diff(t) <= 0.30]
         return tight if tight else [ranked[0]]
 
-    def _best_match_transfers(
-        self,
-        wallet: str,
-        token_lower: str,
-        transactions: list[dict],
-        target_amount: float,
-    ) -> list[dict]:
-        """
-        Coleta todas as saídas do wallet e delega a seleção ao _pick_best_from_list.
-        Resolve o problema de tokens por símbolo onde qualquer SPL token é aceito.
-        """
+    def _best_match_transfers(self, wallet: str, token_lower: str, transactions: list[dict], target_amount: float) -> list[dict]:
         all_transfers = self._extract_outgoing_transfers(wallet, token_lower, transactions)
         if not all_transfers:
             return []
@@ -853,17 +780,6 @@ class SolanaFetcher:
         received_amount: Optional[float] = None,
         max_amount_ratio: float = 10.0,
     ) -> list[dict]:
-        """
-        Extrai transferências de saída de um wallet para um token.
-        Usado internamente por _best_match_transfers (HOP 0->1) e diretamente (HOP 1->2+).
-
-        Args:
-            min_timestamp:    Ignora TXs anteriores a este timestamp (hops 1->2+).
-            received_amount:  Valor recebido no hop anterior. TXs com valor
-                              > received_amount * max_amount_ratio são ignoradas
-                              (possíveis fundos pré-existentes não relacionados ao roubo).
-            max_amount_ratio: Multiplicador de tolerância sobre received_amount (padrão 10x).
-        """
         transfers = []
         wallet_lower = wallet.lower()
         is_sol = token_lower in SOL_SYMBOLS
@@ -872,20 +788,16 @@ class SolanaFetcher:
             sig = tx.get("signature", "")
             ts = tx.get("timestamp", 0) or 0
 
-            # Filtro temporal: ignora TXs anteriores à chegada dos fundos roubados
             if min_timestamp and ts and ts < min_timestamp:
                 continue
 
-            # Token transfers (SPL)
             if not is_sol:
                 for t in tx.get("tokenTransfers", []):
                     from_acct = (t.get("fromUserAccount") or "").lower()
                     mint = (t.get("mint") or "").lower()
                     to_acct = t.get("toUserAccount") or ""
 
-                    mint_match = (mint == token_lower) or (
-                        not self._looks_like_address(token_lower)
-                    )
+                    mint_match = (mint == token_lower) or (not self._looks_like_address(token_lower))
 
                     if not (from_acct == wallet_lower and to_acct and mint_match):
                         continue
@@ -897,15 +809,9 @@ class SolanaFetcher:
                     except (TypeError, ValueError):
                         amt_float = None
 
-                    # Filtro de proporção (HOP 1->2+): ignora valores muito maiores que o recebido
                     if received_amount and amt_float is not None:
                         if amt_float > float(received_amount) * max_amount_ratio:
-                            print(
-                                f"[Fetcher] Ignorando TX de {amt_float} "
-                                f"(recebido: {received_amount}, ratio: "
-                                f"{amt_float / float(received_amount):.1f}x > "
-                                f"{max_amount_ratio}x) — possível fundo pré-existente"
-                            )
+                            print(f"[Fetcher] Ignorando TX de {amt_float} (recebido: {received_amount}, ratio: {amt_float / float(received_amount):.1f}x) — possível fundo pré-existente")
                             continue
 
                     transfers.append({
@@ -918,7 +824,6 @@ class SolanaFetcher:
                         "timestamp": ts,
                     })
 
-            # Native SOL transfers
             if is_sol:
                 for n in tx.get("nativeTransfers", []):
                     from_acct = (n.get("fromUserAccount") or "").lower()
@@ -930,13 +835,8 @@ class SolanaFetcher:
 
                     outgoing_sol = amt_lamports / 1e9
 
-                    # Filtro de proporção (HOP 1->2+)
                     if received_amount and outgoing_sol > float(received_amount) * max_amount_ratio:
-                        print(
-                            f"[Fetcher] Ignorando TX SOL de {outgoing_sol:.4f} "
-                            f"(recebido: {received_amount}, ratio: "
-                            f"{outgoing_sol / float(received_amount):.1f}x) — possível fundo pré-existente"
-                        )
+                        print(f"[Fetcher] Ignorando TX SOL de {outgoing_sol:.4f} (recebido: {received_amount}, ratio: {outgoing_sol / float(received_amount):.1f}x) — possível fundo pré-existente")
                         continue
 
                     transfers.append({
@@ -953,7 +853,6 @@ class SolanaFetcher:
 
     @staticmethod
     def _looks_like_address(s: str) -> bool:
-        """Verifica se a string parece um endereço Solana (base58, ~44 chars)."""
         return len(s) >= 32 and len(s) <= 50
 
     @staticmethod
