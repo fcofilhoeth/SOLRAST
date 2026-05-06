@@ -45,9 +45,14 @@ HELIUS_SOURCE_TO_DEX: dict[str, tuple[str, str]] = {
     "SANCTUM":   ("Sanctum Router",           "5ocnV1qiCgaQR8Jb8xWnVbApfaygJ8tNoZfgPwsgx9kx"),
 }
 
-# Nomes amigáveis para mints conhecidos
+# Nomes amigáveis para mints conhecidos (case-insensitive)
+_STABLE_LOWER = {k.lower(): v for k, v in STABLECOIN_MINTS.items()}
+
 def _mint_display_name(mint: str) -> str:
-    name = STABLECOIN_MINTS.get(mint)
+    if not mint: return ""
+    m = mint.lower()
+    if m in SOL_SYMBOLS or m == SOL_MINT.lower(): return "SOL"
+    name = _STABLE_LOWER.get(m)
     if name: return name
     return mint[:20] + "..." if len(mint) > 20 else mint
 
@@ -109,7 +114,13 @@ class SolanaFetcher:
             if u == wl or not u:
                 m = out.get("mint") or ""
                 a = out.get("tokenAmount") or out.get("amount")
-                if m: return m, float(a) if a else None
+                if a is None:
+                    rta = out.get("rawTokenAmount") or {}
+                    raw = rta.get("tokenAmount"); dec = rta.get("decimals")
+                    if raw is not None and dec is not None:
+                        try: a = float(raw) / (10 ** int(dec))
+                        except (TypeError, ValueError): a = None
+                if m: return m, float(a) if a is not None else None
         no = sw.get("nativeOutput")
         if no:
             u = (no.get("account") or "").lower()
@@ -137,12 +148,115 @@ class SolanaFetcher:
 
         return None, None
 
+    # Limiar: valores abaixo disso em nativeInput são tip Jito / dust, não swap real.
+    _JITO_TIP_MAX_LAMPORTS = 10_000
+
+    def _get_swap_input_amount(self, tx: dict, wallet: str, is_sol: bool,
+                               token_mint: Optional[str] = None) -> Optional[float]:
+        """
+        Extrai o valor REAL do input de um swap. Estratégia em camadas:
+          1) events.swap.nativeInput / tokenInputs do Helius (quando confiável)
+          2) Reconstrução via accountData (ΔSOL da wallet − fee − tips − rent de ATAs)
+          3) None → deixa o chamador usar _sum_outgoing filtrado como último recurso
+        O Helius às vezes reporta só o tip Jito em nativeInput (ex: Jupiter via Orca
+        com WSOL efêmera), então validamos e recorremos à camada 2 nesse caso.
+        """
+        wl = wallet.lower()
+        tml = (token_mint or "").lower()
+        sw = (tx.get("events") or {}).get("swap") or {}
+
+        if is_sol:
+            ni = sw.get("nativeInput") or {}
+            acct = (ni.get("account") or "").lower()
+            try: amt = int(ni.get("amount") or 0)
+            except (TypeError, ValueError): amt = 0
+            # Usa nativeInput só se a conta bate e o valor é grande o suficiente
+            # para não ser só tip Jito / priority fee.
+            if amt > self._JITO_TIP_MAX_LAMPORTS and (not acct or acct == wl):
+                return amt / 1e9
+            # Fallback: reconstrói via balance changes reais
+            recon = self._reconstruct_sol_swap_input(tx, wallet)
+            if recon is not None: return recon
+            return None
+
+        # SPL token: filtra por mint pra não capturar input de outro ativo
+        # (ex: WSOL wrap aparecendo em tokenInputs quando buscamos USDC).
+        for ti in (sw.get("tokenInputs") or []):
+            acct = (ti.get("userAccount") or "").lower()
+            mint = (ti.get("mint") or "").lower()
+            if acct and acct != wl: continue
+            if tml and mint and mint != tml: continue
+            amt = ti.get("tokenAmount")
+            if amt is None:
+                rta = ti.get("rawTokenAmount") or {}
+                raw = rta.get("tokenAmount"); dec = rta.get("decimals")
+                if raw is not None and dec is not None:
+                    try: return float(raw) / (10 ** int(dec))
+                    except (TypeError, ValueError): continue
+            else:
+                try: return float(amt)
+                except (TypeError, ValueError): continue
+        return None
+
+    def _reconstruct_sol_swap_input(self, tx: dict, wallet: str) -> Optional[float]:
+        """
+        Reconstrói o valor efetivo de SOL que entrou num swap, usando accountData:
+          swap_in ≈ |ΔSOL da wallet| − fee − tips Jito − rent de ATAs criadas
+        É o caminho mais robusto quando events.swap do Helius é inconsistente.
+        """
+        wl = wallet.lower()
+        ads = tx.get("accountData") or []
+        if not ads: return None
+
+        user_delta = 0
+        tip_total = 0
+        rent_total = 0
+        for ad in ads:
+            acct = ad.get("account") or ""
+            nbc = ad.get("nativeBalanceChange") or 0
+            tbc = ad.get("tokenBalanceChanges") or []
+            if acct.lower() == wl:
+                user_delta = nbc  # negativo pra swap-out de SOL
+            elif nbc >= 2_000_000 and tbc:  # ATA criada (rent exempt ~2.04M)
+                rent_total += nbc
+            elif 0 < nbc <= self._JITO_TIP_MAX_LAMPORTS:
+                # Micro-transferência (Jito tip, priority fee). Sem sinal de swap.
+                tip_total += nbc
+
+        if user_delta >= 0: return None  # não houve saída de SOL do usuário
+        try: fee = int(tx.get("fee") or 0)
+        except (TypeError, ValueError): fee = 0
+
+        swap_in = (-user_delta) - fee - tip_total - rent_total
+        if swap_in <= 0: return None
+        return swap_in / 1e9
+
+    def _find_protocol_accounts_in_tx(self, tx: dict) -> set[str]:
+        """
+        M2: pubkeys de contas criadas/auxiliares nesta TX (ATAs novas,
+        WSOL temporárias) — transferências para elas não são "destinos reais",
+        são apenas mecânica do protocolo (rent, wrap).
+        """
+        created: set[str] = set()
+        for ad in (tx.get("accountData") or []):
+            acct = ad.get("account") or ""
+            if not acct: continue
+            nbc = ad.get("nativeBalanceChange") or 0
+            tbc = ad.get("tokenBalanceChanges") or []
+            # ATA criada/funded: recebeu >= rent-exempt e tem mudança de token
+            if nbc >= 2_000_000 and tbc:
+                created.add(acct)
+        return created
+
     def _sum_outgoing(self, wl: str, tx: dict, is_sol: bool) -> Optional[float]:
+        protocol_accts = self._find_protocol_accounts_in_tx(tx)
         total, found = 0.0, False
         key = "nativeTransfers" if is_sol else "tokenTransfers"
         amt_key = "amount" if is_sol else "tokenAmount"
         for t in tx.get(key, []):
             if (t.get("fromUserAccount") or "").lower() == wl:
+                to = t.get("toUserAccount") or ""
+                if to in protocol_accts: continue
                 try:
                     v = float(t.get(amt_key) or 0)
                     if is_sol: v /= 1e9
@@ -416,6 +530,7 @@ class SolanaFetcher:
                         recv_ts=recv_ts,
                         current_mint=current_mint,
                         total_processed=total_processed,
+                        recv_amount=recv_amount,
                     )
                     continue
 
@@ -462,7 +577,21 @@ class SolanaFetcher:
 
     async def _handle_dex_swap(self, graph: dict, visited: set, bfs_queue: list,
                                 hop_wallet: str, swap_tx: dict, depth: int,
-                                recv_ts: int, current_mint: str, total_processed: int):
+                                recv_ts: int, current_mint: str, total_processed: int,
+                                recv_amount: Optional[float] = None):
+        # M3: residual = quanto do token de ENTRADA ficou na wallet (não foi swappado).
+        try:
+            swap_in = float(swap_tx.get("amount") or 0)
+        except (TypeError, ValueError):
+            swap_in = 0.0
+        if recv_amount is not None and swap_in > 0:
+            try:
+                residual = float(recv_amount) - swap_in
+                if residual > 1e-7:
+                    self._attach_residual(graph, hop_wallet, current_mint, residual)
+            except (TypeError, ValueError):
+                pass
+
         """
         Processa um swap DEX:
         1. Adiciona nó DEX ao grafo
@@ -538,6 +667,7 @@ class SolanaFetcher:
                         depth=depth + 1, recv_ts=swap_ts,
                         current_mint=out_mint_lower,
                         total_processed=total_processed,
+                        recv_amount=output_amount,
                     )
                 continue
 
@@ -564,12 +694,29 @@ class SolanaFetcher:
     def _mark_parked(self, graph: dict, wallet: str, recv_ts: int, token: str = ""):
         for n in graph["nodes"]:
             if n["id"] == wallet:
-                token_disp = _mint_display_name(token) if token else ""
                 n["type"]      = "PARKED"
                 n["is_parked"] = True
-                n["label"]     = f"Carteira Estacionada{f' ({token_disp})' if token_disp else ''}"
+                n["label"]     = "Carteira Estacionada"
                 n["recv_ts"]   = recv_ts
                 n["parked_token"] = token
+                break
+
+    def _attach_residual(self, graph: dict, wallet: str, mint: str, amount: float):
+        """
+        M3: em swap parcial, registra no nó o montante do token/SOL de ENTRADA
+        que NÃO foi swappado (ficou na wallet). Útil para evitar a ilusão
+        de que todo o valor recebido virou o token de saída.
+        """
+        if not amount or amount <= 1e-9: return
+        for n in graph["nodes"]:
+            if n["id"] == wallet:
+                residuals = n.setdefault("residuals", [])
+                residuals.append({
+                    "mint": mint,
+                    "mint_name": _mint_display_name(mint) if mint else "",
+                    "amount": float(amount),
+                })
+                n["has_residual"] = True
                 break
 
     def _mark_split(self, graph: dict, wallet: str, split_count: int):
@@ -609,17 +756,20 @@ class SolanaFetcher:
             })
 
     def _add_edge(self, graph: dict, frm: str, to: str, tx: dict):
+        in_mint = tx.get("mint") or ""
+        out_mint = tx.get("output_mint") or ""
         graph["edges"].append({
             "from": frm, "to": to,
-            "amount": tx.get("amount"), "mint": tx.get("mint"),
+            "amount": tx.get("amount"), "mint": in_mint,
+            "mint_name": _mint_display_name(in_mint) if in_mint else None,
             "timestamp": tx.get("timestamp"),
             "timestamp_human": self._ts_to_human(tx.get("timestamp")),
             "signature": tx.get("signature"),
             "transfer_type": tx.get("transfer_type", "TRANSFER"),
             "dex_name": tx.get("dex_name"),
-            "output_mint": tx.get("output_mint"),
+            "output_mint": out_mint,
             "output_amount": tx.get("output_amount"),
-            "output_mint_name": _mint_display_name(tx.get("output_mint") or "") if tx.get("output_mint") else None,
+            "output_mint_name": _mint_display_name(out_mint) if out_mint else None,
         })
 
     def _update_detections(self, graph: dict, cls: dict):
@@ -747,8 +897,15 @@ class SolanaFetcher:
                     or any((n.get("fromUserAccount") or "").lower() == wl for n in tx.get("nativeTransfers", []))
                 )
                 if is_sender:
-                    swap_amt = self._sum_outgoing(wl, tx, is_sol)
-                    if received_amount and swap_amt and swap_amt > float(received_amount) * max_amount_ratio: continue
+                    # Valor real do input filtrado pelo mint que estamos rastreando.
+                    # Se None, o token_lower NÃO é input deste swap (é output ou
+                    # não-relacionado) — então não geramos aresta de swap aqui.
+                    swap_amt = self._get_swap_input_amount(tx, wallet, is_sol, token_mint=token_lower)
+                    if swap_amt is None and is_sol:
+                        swap_amt = self._sum_outgoing(wl, tx, is_sol)
+                    if swap_amt is None or swap_amt <= 0:
+                        continue
+                    if received_amount and swap_amt > float(received_amount) * max_amount_ratio: continue
                     out_mint, out_amt = self._get_swap_output_token(tx, wallet)
                     transfers.append({
                         "transfer_type": "DEX_SWAP", "type": "dex_swap",

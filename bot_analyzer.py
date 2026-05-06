@@ -243,15 +243,32 @@ Para casos com alta complexidade, o sistema escala automaticamente para o Agente
                 sig    = e.get("signature") or "?"
                 t_type = e.get("transfer_type", "TRANSFER")
                 dex_n  = e.get("dex_name", "")
+                in_m   = e.get("mint", "")
                 out_m  = e.get("output_mint", "")
+                in_name  = e.get("mint_name") or (in_m[:20] + "..." if in_m and len(in_m) > 20 else in_m)
 
                 if t_type == "DEX_SWAP" and dex_n:
-                    lines.append(f"{indent}        ↓ SWAP via {dex_n} | entrada: {amt}")
-                    if out_m: lines.append(f"{indent}        ↳ token saída: {out_m[:30]}...")
+                    entrada = f"{amt} {in_name}" if in_name else str(amt)
+                    lines.append(f"{indent}        ↓ SWAP via {dex_n} | entrada: {entrada}")
+                    if out_m:
+                        out_name = e.get("output_mint_name") or (out_m[:20] + "..." if len(out_m) > 20 else out_m)
+                        out_amt  = e.get("output_amount")
+                        if out_amt is not None:
+                            lines.append(f"{indent}        ↳ saída: {out_amt} {out_name}")
+                        else:
+                            lines.append(f"{indent}        ↳ saída: {out_name}")
                 else:
-                    lines.append(f"{indent}        ↓ {amt}")
+                    val = f"{amt} {in_name}" if in_name else str(amt)
+                    lines.append(f"{indent}        ↓ {val}")
                 lines.append(f"{indent}        TX: {sig}")
                 lines.append(f"{indent}[{label}: {nid}]{icon}")
+                # M3: residual não-swappado (token de entrada que ficou parado)
+                for res in (node.get("residuals") or []):
+                    rn = res.get("mint_name") or ""
+                    if not rn:
+                        m = (res.get("mint") or "")
+                        rn = "SOL" if m.lower() in ("sol", "solana") else (m[:20] + "..." if len(m) > 20 else m)
+                    lines.append(f"{indent}        🅿️ residual: {res.get('amount')} {rn} (não swappado)")
 
         return "\n".join(lines) if len(lines) > 1 else f"[Vítima: {wallet}]\n    (sem transferências identificadas)"
 
@@ -303,13 +320,16 @@ Solicito: 1) Bloqueio preventivo 2) Preservação KYC 3) Cooperação legal
                  "O token original pode ter sido convertido, dificultando rastreamento direto.\n"]
         for e in edges:
             if e.get("transfer_type") == "DEX_SWAP" or e.get("dex_name"):
-                out_m = e.get("output_mint") or "desconhecido"
+                in_m  = e.get("mint") or ""
+                in_n  = e.get("mint_name") or in_m
+                out_m = e.get("output_mint") or ""
+                out_n = e.get("output_mint_name") or (out_m[:40] if out_m else "desconhecido")
                 out_a = e.get("output_amount")
                 lines += [
                     f"**Swap:** `{e.get('from','?')[:30]}...`",
                     f"- DEX: **{e.get('dex_name','?')}**",
-                    f"- Entrada: {e.get('amount','?')} | TX: `{(e.get('signature') or '?')[:50]}...`",
-                    f"- Token saída: `{out_m[:40]}` | Valor saída: {out_a or 'desconhecido'}",
+                    f"- Entrada: {e.get('amount','?')} {in_n} | TX: `{(e.get('signature') or '?')[:50]}...`",
+                    f"- Saída: {out_a if out_a is not None else 'desconhecido'} {out_n}",
                     f"- Timestamp: {e.get('timestamp_human','?')}\n",
                 ]
         lines += [
@@ -405,11 +425,18 @@ Solicito: 1) Bloqueio preventivo 2) Preservação KYC 3) Cooperação legal
             tt   = e.get("transfer_type","TRANSFER")
             dexn = e.get("dex_name","")
             outm = e.get("output_mint","")
+            in_n = e.get("mint_name") or e.get("mint","")
+            out_n = e.get("output_mint_name") or (outm[:25] if outm else "")
+            out_a = e.get("output_amount")
             if tt == "DEX_SWAP" and dexn:
-                action = f"SWAP via {dexn} | entrada: {amt}"
-                if outm: action += f" | saída: {outm[:25]}..."
+                action = f"SWAP via {dexn} | entrada: {amt} {in_n}".rstrip()
+                if outm:
+                    if out_a is not None:
+                        action += f" | saída: {out_a} {out_n}"
+                    else:
+                        action += f" | saída: {out_n}"
             else:
-                action = f"Valor: {amt}"
+                action = f"Valor: {amt} {in_n}".rstrip() if in_n else f"Valor: {amt}"
             events.append((ts, f"- **{tsh}**\n  - De: `{frm}`\n  - Para: `{to}` ({lbl})\n  - {action}\n  - TX: `{sig}`"))
         events.sort(key=lambda x: x[0])
         return "\n".join(e[1] for e in events) if events else "_Nenhum evento encontrado._"
