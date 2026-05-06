@@ -3,33 +3,38 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>SolTrace — Investigador On-Chain Solana</title>
+  <title>OnTrac — Blockchain Intelligence</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Sora:wght@300;400;600;700&display=swap" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&family=Playfair+Display:wght@500;600;700&display=swap" rel="stylesheet" />
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
     :root {
-      --sol-green:   #14F195;
-      --sol-purple:  #9945FF;
-      --sol-bg:      #07070f;
-      --sol-surface: #0f0f1a;
-      --sol-card:    #111120;
-      --sol-border:  rgba(153, 69, 255, 0.2);
-      --sol-border2: rgba(20, 241, 149, 0.2);
-      --sol-text:    #e2e2f0;
-      --sol-muted:   #7a7a99;
-      --sol-red:     #FF6B6B;
-      --sol-orange:  #FFB347;
+      --sol-green:   #b6966a;
+      --sol-purple:  #685538;
+      --sol-bg:      #1c1a17;
+      --sol-surface: #24211c;
+      --sol-card:    rgba(18, 18, 15, 0.94);
+      --sol-border:  rgba(182, 150, 106, 0.32);
+      --sol-border2: rgba(104, 85, 56, 0.4);
+      --sol-text:    #e8e1d6;
+      --sol-muted:   #9d907f;
+      --sol-red:     #d56f61;
+      --sol-orange:  #b6966a;
+      --ot-paper:    #e8e1d6;
+      --ot-gold-dark:#6b5538;
     }
 
     html { scroll-behavior: smooth; }
 
     body {
-      background: var(--sol-bg);
-      font-family: 'Sora', sans-serif;
+      background:
+        radial-gradient(circle at 72% 6%, rgba(182,150,106,0.12), transparent 32%),
+        radial-gradient(circle at 20% 88%, rgba(104,85,56,0.14), transparent 34%),
+        linear-gradient(140deg, #10110f 0%, var(--sol-bg) 45%, #0c0d0b 100%);
+      font-family: 'Inter', sans-serif;
       color: var(--sol-text);
       min-height: 100vh;
       overflow-x: hidden;
@@ -40,22 +45,19 @@
       position: fixed;
       inset: 0;
       background-image:
-        linear-gradient(rgba(153,69,255,0.04) 1px, transparent 1px),
-        linear-gradient(90deg, rgba(153,69,255,0.04) 1px, transparent 1px);
-      background-size: 40px 40px;
+        linear-gradient(rgba(182,150,106,0.035) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(182,150,106,0.028) 1px, transparent 1px),
+        radial-gradient(circle at 50% 50%, rgba(232,225,214,0.035), transparent 28%);
+      background-size: 44px 44px, 44px 44px, 620px 620px;
       pointer-events: none;
       z-index: 0;
     }
 
     .orb {
-      position: fixed;
-      border-radius: 50%;
-      filter: blur(120px);
-      pointer-events: none;
-      z-index: 0;
+      display: none;
     }
-    .orb-1 { width: 500px; height: 500px; background: rgba(153,69,255,0.12); top: -150px; right: -100px; }
-    .orb-2 { width: 400px; height: 400px; background: rgba(20,241,149,0.08); bottom: -100px; left: -100px; }
+    .orb-1 { width: 500px; height: 500px; background: rgba(182,150,106,0.12); top: -150px; right: -100px; }
+    .orb-2 { width: 400px; height: 400px; background: rgba(104,85,56,0.12); bottom: -100px; left: -100px; }
 
     .container {
       position: relative;
@@ -68,22 +70,49 @@
     .header {
       text-align: center;
       margin-bottom: 48px;
+      padding: 28px 0 10px;
     }
 
     .logo {
       display: inline-flex;
       align-items: center;
-      gap: 14px;
-      margin-bottom: 16px;
+      gap: 18px;
+      margin-bottom: 18px;
     }
 
     .logo-icon {
-      width: 56px; height: 56px;
-      border-radius: 16px;
-      background: linear-gradient(135deg, #9945FF, #14F195);
+      width: 64px; height: 64px;
+      border-radius: 50%;
+      border: 1px solid rgba(182,150,106,0.72);
+      background:
+        radial-gradient(circle, rgba(182,150,106,0.08), transparent 62%),
+        rgba(15,16,14,0.78);
       display: flex; align-items: center; justify-content: center;
-      font-size: 26px;
-      box-shadow: 0 0 30px rgba(153,69,255,0.4);
+      font-size: 0;
+      box-shadow: 0 0 34px rgba(182,150,106,0.16), inset 0 0 0 8px rgba(182,150,106,0.05);
+      position: relative;
+    }
+
+    .logo-icon::before {
+      content: '';
+      width: 27px; height: 27px;
+      border: 3px solid var(--sol-green);
+      border-radius: 50%;
+      position: absolute;
+      left: 17px;
+      top: 16px;
+    }
+
+    .logo-icon::after {
+      content: '';
+      width: 23px;
+      height: 3px;
+      background: var(--sol-green);
+      position: absolute;
+      right: 11px;
+      bottom: 14px;
+      transform: rotate(45deg);
+      transform-origin: center;
     }
 
     .logo-text { text-align: left; }
@@ -98,28 +127,31 @@
     }
 
     .logo-name {
-      font-size: 28px;
-      font-weight: 700;
-      color: #fff;
-      letter-spacing: -0.5px;
+      font-family: 'Playfair Display', serif;
+      font-size: 46px;
+      font-weight: 600;
+      color: var(--ot-paper);
+      letter-spacing: 0;
+      line-height: 0.95;
     }
 
     .header-desc {
       font-size: 15px;
       color: var(--sol-muted);
       line-height: 1.6;
-      max-width: 520px;
+      max-width: 620px;
       margin: 0 auto;
     }
 
     .card {
       background: var(--sol-card);
       border: 1px solid var(--sol-border);
-      border-radius: 20px;
+      border-radius: 8px;
       padding: 32px;
       margin-bottom: 24px;
       position: relative;
       overflow: hidden;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.34), inset 0 1px 0 rgba(232,225,214,0.04);
     }
 
     .card::before {
@@ -127,7 +159,7 @@
       position: absolute;
       top: 0; left: 0; right: 0;
       height: 1px;
-      background: linear-gradient(90deg, transparent, rgba(153,69,255,0.5), transparent);
+      background: linear-gradient(90deg, transparent, rgba(182,150,106,0.62), transparent);
     }
 
     .card-title {
@@ -146,7 +178,7 @@
       content: '';
       flex: 1;
       height: 1px;
-      background: linear-gradient(90deg, rgba(20,241,149,0.3), transparent);
+      background: linear-gradient(90deg, rgba(182,150,106,0.35), transparent);
     }
 
     .form-grid {
@@ -171,7 +203,7 @@
     input {
       background: rgba(0,0,0,0.4);
       border: 1px solid var(--sol-border);
-      border-radius: 10px;
+      border-radius: 6px;
       padding: 12px 16px;
       font-family: 'JetBrains Mono', monospace;
       font-size: 13px;
@@ -184,7 +216,7 @@
     input::placeholder { color: rgba(122,122,153,0.5); }
     input:focus {
       border-color: var(--sol-purple);
-      box-shadow: 0 0 0 3px rgba(153,69,255,0.12);
+      box-shadow: 0 0 0 3px rgba(182,150,106,0.12);
     }
 
     input.input-error {
@@ -208,9 +240,9 @@
       padding: 16px 24px;
       border-radius: 12px;
       border: none;
-      background: linear-gradient(135deg, #9945FF, #7b2fd4);
-      color: #fff;
-      font-family: 'Sora', sans-serif;
+      background: linear-gradient(135deg, #b6966a, #6b5538);
+      color: #11110f;
+      font-family: 'Inter', sans-serif;
       font-size: 15px;
       font-weight: 600;
       cursor: pointer;
@@ -219,7 +251,7 @@
       justify-content: center;
       gap: 10px;
       transition: all 0.2s;
-      box-shadow: 0 4px 20px rgba(153,69,255,0.3);
+      box-shadow: 0 8px 28px rgba(182,150,106,0.22);
       position: relative;
       overflow: hidden;
     }
@@ -233,7 +265,7 @@
       transition: opacity 0.2s;
     }
 
-    .btn-investigate:hover { transform: translateY(-1px); box-shadow: 0 6px 25px rgba(153,69,255,0.45); }
+    .btn-investigate:hover { transform: translateY(-1px); box-shadow: 0 10px 32px rgba(182,150,106,0.34); }
     .btn-investigate:hover::after { opacity: 1; }
     .btn-investigate:active { transform: translateY(0); }
     .btn-investigate:disabled { opacity: 0.6; cursor: not-allowed; transform: none; }
@@ -262,25 +294,25 @@
       border-radius: 8px;
       display: flex; align-items: center; justify-content: center;
       font-size: 14px;
-      background: rgba(153,69,255,0.1);
-      border: 1px solid rgba(153,69,255,0.2);
+      background: rgba(182,150,106,0.08);
+      border: 1px solid rgba(182,150,106,0.22);
       flex-shrink: 0;
     }
 
     .step.active .step-icon {
-      background: rgba(153,69,255,0.2);
+      background: rgba(182,150,106,0.16);
       border-color: var(--sol-purple);
       animation: pulse-icon 1s infinite;
     }
 
     .step.done .step-icon {
-      background: rgba(20,241,149,0.1);
+      background: rgba(182,150,106,0.11);
       border-color: var(--sol-green);
     }
 
     @keyframes pulse-icon {
-      0%, 100% { box-shadow: 0 0 0 0 rgba(153,69,255,0.4); }
-      50% { box-shadow: 0 0 0 6px rgba(153,69,255,0); }
+      0%, 100% { box-shadow: 0 0 0 0 rgba(182,150,106,0.36); }
+      50% { box-shadow: 0 0 0 6px rgba(182,150,106,0); }
     }
 
     .step-label { font-size: 13px; color: var(--sol-text); }
@@ -295,7 +327,7 @@
 
     .progress-bar {
       height: 3px;
-      background: rgba(153,69,255,0.15);
+      background: rgba(182,150,106,0.12);
       border-radius: 2px;
       margin-bottom: 24px;
       overflow: hidden;
@@ -303,7 +335,7 @@
 
     .progress-fill {
       height: 100%;
-      background: linear-gradient(90deg, var(--sol-purple), var(--sol-green));
+      background: linear-gradient(90deg, var(--ot-gold-dark), var(--sol-green));
       border-radius: 2px;
       width: 0%;
       transition: width 0.5s ease;
@@ -330,19 +362,19 @@
 
     .report-content h1,
     .report-content h2,
-    .report-content h3 { color: #fff; margin: 24px 0 12px; font-family: 'Sora', sans-serif; }
+    .report-content h3 { color: #fff; margin: 24px 0 12px; font-family: 'Inter', sans-serif; }
 
-    .report-content h3 { font-size: 15px; color: var(--sol-green); display: flex; align-items: center; gap: 8px; }
+    .report-content h3 { font-family: 'Playfair Display', serif; font-size: 19px; color: var(--sol-green); display: flex; align-items: center; gap: 8px; }
     .report-content p { margin-bottom: 12px; }
 
     .report-content code {
       font-family: 'JetBrains Mono', monospace;
       font-size: 12px;
-      background: rgba(153,69,255,0.12);
-      border: 1px solid rgba(153,69,255,0.2);
+      background: rgba(182,150,106,0.12);
+      border: 1px solid rgba(182,150,106,0.22);
       border-radius: 4px;
       padding: 2px 6px;
-      color: #c8b4ff;
+      color: #d8c3a3;
       word-break: break-all;
     }
 
@@ -360,7 +392,7 @@
     .report-content table { width: 100%; border-collapse: collapse; margin: 16px 0; font-size: 13px; }
 
     .report-content th {
-      background: rgba(153,69,255,0.15);
+      background: rgba(182,150,106,0.15);
       border: 1px solid var(--sol-border);
       padding: 10px 14px;
       text-align: left;
@@ -388,8 +420,8 @@
       border: 1px solid;
     }
 
-    .chip-green { color: var(--sol-green); border-color: rgba(20,241,149,0.3); background: rgba(20,241,149,0.06); }
-    .chip-purple { color: #BB86FC; border-color: rgba(187,134,252,0.3); background: rgba(187,134,252,0.06); }
+    .chip-green { color: var(--sol-green); border-color: rgba(182,150,106,0.38); background: rgba(182,150,106,0.08); }
+    .chip-purple { color: #d8c3a3; border-color: rgba(182,150,106,0.3); background: rgba(182,150,106,0.06); }
     .chip-orange { color: var(--sol-orange); border-color: rgba(255,179,71,0.3); background: rgba(255,179,71,0.06); }
     .chip-red { color: var(--sol-red); border-color: rgba(255,107,107,0.3); background: rgba(255,107,107,0.06); }
 
@@ -409,6 +441,14 @@
     .footer-text { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--sol-muted); letter-spacing: 1px; }
 
     @media (max-width: 600px) {
+      .container { padding: 24px 16px 64px; }
+      .logo { gap: 12px; }
+      .logo-icon { width: 56px; height: 56px; }
+      .logo-icon::before { left: 14px; top: 13px; }
+      .logo-icon::after { right: 9px; bottom: 12px; }
+      .logo-name { font-size: 38px; }
+      .logo-tag { font-size: 9px; letter-spacing: 2px; }
+      .header-desc { font-size: 14px; }
       .form-grid { grid-template-columns: 1fr; }
       .form-group.full { grid-column: 1; }
       .card { padding: 20px; }
@@ -431,21 +471,21 @@
   <!-- HEADER -->
   <div class="header">
     <div class="logo">
-      <div class="logo-icon">🔍</div>
+      <div class="logo-icon" aria-label="OnTrac"></div>
       <div class="logo-text">
-        <div class="logo-tag">// On-Chain Forensics</div>
-        <div class="logo-name">SolTrace</div>
+        <div class="logo-tag">Blockchain Intelligence</div>
+        <div class="logo-name">OnTrac</div>
       </div>
     </div>
     <p class="header-desc">
-      Investigação forense blockchain para rastreamento de fundos roubados na rede Solana.
-      Detecte CEXs, identifique técnicas de ofuscação e gere relatórios de evidência.
+      Investigamos o invisível e revelamos a verdade on-chain.
+      Rastreie fundos, identifique rotas de risco e gere evidências forenses com precisão.
     </p>
   </div>
 
   <!-- FORM CARD -->
   <div class="card">
-    <div class="card-title">🕵️ Nova Investigação</div>
+    <div class="card-title">Nova Investigação</div>
 
     <div class="form-grid">
       <div class="form-group full">
@@ -502,24 +542,24 @@
           autocomplete="off"
           spellcheck="false"
         />
-        <div class="input-hint required-hint">⚠️ Obrigatório — garante precisão total no rastreamento. Encontre o hash no Solscan ou Solana Explorer.</div>
+        <div class="input-hint required-hint">Obrigatório para iniciar o rastreamento pelo ponto exato da movimentação.</div>
       </div>
     </div>
 
     <button class="btn-investigate" id="btn-investigate" onclick="startInvestigation()">
-      <span id="btn-icon">🔍</span>
+      <span id="btn-icon">⌕</span>
       <span id="btn-text">Iniciar Investigação</span>
     </button>
 
     <div id="error-box">
-      <div class="error-title">⚠️ Erro na Investigação</div>
+      <div class="error-title">Erro na Investigação</div>
       <div class="error-msg" id="error-msg"></div>
     </div>
   </div>
 
   <!-- LOADING CARD -->
   <div class="card" id="loading">
-    <div class="card-title">⚡ Investigando...</div>
+    <div class="card-title">Investigando...</div>
 
     <div class="progress-bar">
       <div class="progress-fill" id="progress-fill"></div>
@@ -527,35 +567,35 @@
 
     <div class="loading-steps">
       <div class="step" id="step-1">
-        <div class="step-icon">🌐</div>
+        <div class="step-icon">01</div>
         <div>
           <div class="step-label">Conectando à blockchain Solana</div>
           <div class="step-sub">Buscando transação via Helius API</div>
         </div>
       </div>
       <div class="step" id="step-2">
-        <div class="step-icon">🗺️</div>
+        <div class="step-icon">02</div>
         <div>
           <div class="step-label">Mapeando fluxo de fundos</div>
           <div class="step-sub">Rastreando transferências a partir do TX hash</div>
         </div>
       </div>
       <div class="step" id="step-3">
-        <div class="step-icon">🏦</div>
+        <div class="step-icon">03</div>
         <div>
           <div class="step-label">Verificando exchanges (CEX)</div>
           <div class="step-sub">Cruzando endereços com base de dados de CEXs conhecidas</div>
         </div>
       </div>
       <div class="step" id="step-4">
-        <div class="step-icon">🤖</div>
+        <div class="step-icon">04</div>
         <div>
-          <div class="step-label">SolTrace analisando evidências</div>
+          <div class="step-label">OnTrac analisando evidências</div>
           <div class="step-sub">IA forense processando dados on-chain...</div>
         </div>
       </div>
       <div class="step" id="step-5">
-        <div class="step-icon">📋</div>
+        <div class="step-icon">05</div>
         <div>
           <div class="step-label">Gerando relatório forense</div>
           <div class="step-sub">Estruturando evidências e recomendações</div>
@@ -566,10 +606,10 @@
 
   <!-- RESULT CARD -->
   <div class="card" id="result">
-    <div class="card-title">📋 Relatório Forense</div>
+    <div class="card-title">Relatório Forense</div>
 
     <div id="cex-alert" class="alert-cex" style="display:none">
-      <div class="alert-icon">🚨</div>
+      <div class="alert-icon">!</div>
       <div>
         <div class="alert-title">FUNDOS DETECTADOS EM EXCHANGE CENTRALIZADA</div>
         <div class="alert-body">
@@ -591,11 +631,11 @@
       <button onclick="copyReport()" style="
         font-family: 'JetBrains Mono', monospace; font-size:12px;
         padding:10px 20px; border-radius:8px; cursor:pointer;
-        border: 1px solid rgba(20,241,149,0.4); background: rgba(20,241,149,0.08);
+        border: 1px solid rgba(182,150,106,0.4); background: rgba(182,150,106,0.08);
         color: var(--sol-green); transition: all 0.15s;
-      " onmouseover="this.style.background='rgba(20,241,149,0.15)'"
-         onmouseout="this.style.background='rgba(20,241,149,0.08)'">
-        ⧉ Copiar Relatório
+      " onmouseover="this.style.background='rgba(182,150,106,0.15)'"
+         onmouseout="this.style.background='rgba(182,150,106,0.08)'">
+        Copiar Relatório
       </button>
       <button onclick="newInvestigation()" style="
         font-family: 'JetBrains Mono', monospace; font-size:12px;
@@ -604,13 +644,13 @@
         color: var(--sol-muted); transition: all 0.15s;
       " onmouseover="this.style.color='var(--sol-text)'"
          onmouseout="this.style.color='var(--sol-muted)'">
-        ← Nova Investigação
+        Nova Investigação
       </button>
     </div>
   </div>
 
   <div class="footer">
-    <div class="footer-text">SolTrace v1.0 · Powered by OpenAI GPT-4o-mini · Solana Blockchain Forensics</div>
+    <div class="footer-text">OnTrac v1.0 · Blockchain Intelligence · On-chain forensic reporting</div>
   </div>
 
 </div>
@@ -712,22 +752,22 @@
     const chipsEl = document.getElementById('meta-chips');
     chipsEl.innerHTML = '';
 
-    const methodLabel = meta.analysis_method === 'bot' ? '⚙️ BOT Rule-Based' : `🤖 IA ${meta.model || 'gpt-4o-mini'}`;
+    const methodLabel = meta.analysis_method === 'bot' ? 'BOT Rule-Based' : `IA ${meta.model || 'gpt-4o-mini'}`;
     const methodCls   = meta.analysis_method === 'bot' ? 'chip-green' : 'chip-purple';
 
     const chips = [
       { label: `${meta.transactions_analyzed || 0} TXs analisadas`, cls: 'chip-purple' },
       { label: `${meta.graph_nodes || 0} endereços no grafo`, cls: 'chip-purple' },
-      { label: meta.helius_used ? 'Helius API ✓' : 'RPC Público', cls: meta.helius_used ? 'chip-green' : 'chip-orange' },
+      { label: meta.helius_used ? 'Helius API' : 'RPC Público', cls: meta.helius_used ? 'chip-green' : 'chip-orange' },
       { label: methodLabel, cls: methodCls },
-      { label: '🎯 TX Hash verificado', cls: 'chip-green' },
+      { label: 'TX Hash verificado', cls: 'chip-green' },
     ];
 
     if (meta.cex_detected?.length > 0) {
-      meta.cex_detected.forEach(cex => chips.push({ label: `⚠️ ${cex} detectada`, cls: 'chip-red' }));
+      meta.cex_detected.forEach(cex => chips.push({ label: `${cex} detectada`, cls: 'chip-red' }));
     }
     if (meta.bridge_detected?.length > 0) {
-      meta.bridge_detected.forEach(bridge => chips.push({ label: `🌉 ${bridge}`, cls: 'chip-orange' }));
+      meta.bridge_detected.forEach(bridge => chips.push({ label: bridge, cls: 'chip-orange' }));
     }
 
     chips.forEach(c => {
@@ -752,7 +792,7 @@
     navigator.clipboard.writeText(currentReportText).then(() => {
       const btn = event.target;
       const orig = btn.textContent;
-      btn.textContent = '✓ Copiado!';
+      btn.textContent = 'Copiado';
       setTimeout(() => btn.textContent = orig, 2000);
     });
   }
@@ -775,8 +815,8 @@
     const icon = document.getElementById('btn-icon');
     const text = document.getElementById('btn-text');
     btn.disabled = loading;
-    if (loading) { icon.textContent = '⏳'; text.textContent = 'Investigando...'; }
-    else         { icon.textContent = '🔍'; text.textContent = 'Iniciar Investigação'; }
+    if (loading) { icon.textContent = '...'; text.textContent = 'Investigando...'; }
+    else         { icon.textContent = '⌕'; text.textContent = 'Iniciar Investigação'; }
   }
 
   function showLoading()  { document.getElementById('loading').style.display = 'block'; }
